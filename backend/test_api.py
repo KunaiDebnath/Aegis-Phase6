@@ -41,6 +41,17 @@ class TestAegisBackendApi(unittest.TestCase):
         self.assertEqual(data.get("database"), "connected")
         self.assertEqual(data.get("status"), "healthy")
 
+    def test_service_discovery_endpoint(self):
+        status, data = self.make_request("/api/discovery")
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("service"), "aegis")
+        self.assertEqual(data.get("status"), "healthy")
+        self.assertEqual(data.get("api_port"), 8000)
+        self.assertEqual(data.get("livekit_port"), 7880)
+        self.assertTrue(data.get("api_base_url", "").startswith("http://"))
+        self.assertTrue(data.get("livekit_url", "").startswith("ws://"))
+        self.assertIn("lan_ip", data)
+
     def test_emergency_creation_without_location_backward_compatible(self):
         idempotency_key = f"test-no-loc-{uuid.uuid4()}"
         payload = {

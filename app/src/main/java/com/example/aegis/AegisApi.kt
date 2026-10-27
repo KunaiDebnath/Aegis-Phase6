@@ -7,6 +7,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
@@ -136,7 +137,26 @@ data class RegisterFcmTokenRequest(
     val fcm_token: String
 )
 
+data class ServerDiscoveryResponse(
+    val service: String,
+    val status: String,
+    val server_name: String? = null,
+    val lan_ip: String,
+    val api_port: Int = 8000,
+    val api_base_url: String,
+    val livekit_url: String,
+    val livekit_port: Int = 7880,
+    val version: String? = null
+)
+
 interface AegisApi {
+
+    @GET("health")
+    suspend fun getHealthCheck(): Response<Map<String, Any?>>
+
+    @GET("api/discovery")
+    suspend fun getDiscoveryMetadata(): Response<ServerDiscoveryResponse>
+
     @POST("api/emergencies")
     suspend fun createEmergency(
         @Body request: SOSRequest
@@ -190,6 +210,17 @@ interface AegisApi {
     suspend fun registerFcmToken(
         @Body request: RegisterFcmTokenRequest
     ): Response<Map<String, String>>
+
+    @GET("api/contacts/{deviceId}/emergency")
+    suspend fun getEmergencyContact(
+        @Path("deviceId") deviceId: String
+    ): Response<EmergencyContactResponse>
+
+    @PUT("api/contacts/{deviceId}/emergency")
+    suspend fun saveEmergencyContact(
+        @Path("deviceId") deviceId: String,
+        @Body request: SaveEmergencyContactRequest
+    ): Response<EmergencyContactResponse>
 }
 
 object AegisApiClient {

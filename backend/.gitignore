@@ -1,0 +1,10 @@
+# Backend Local Git Ignore (Defense-in-Depth)
+.env
+*.env
+serviceAccountKey.json
+*serviceAccount*.json
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

@@ -22,11 +22,11 @@ class AegisFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        Log.i(TAG, "New FCM Registration Token: ${token.take(15)}...")
+        val tokenPreview = if (token.length > 12) "${token.take(6)}...${token.takeLast(4)}" else token
+        Log.i(TAG, "New FCM Registration Token: $tokenPreview")
 
         AegisPreferences.setFcmToken(applicationContext, token)
         CallSignalingClient.fcmTokenState.value = token
-        val tokenPreview = if (token.length > 12) "${token.take(6)}...${token.takeLast(4)}" else token
         CallSignalingClient.fcmStatusMessage.value = "FCM: Registered ($tokenPreview)"
 
         val deviceId = AegisPreferences.getDeviceId(applicationContext)

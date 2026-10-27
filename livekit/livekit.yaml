@@ -12,8 +12,7 @@ rtc:
   port_range_start: 50000
   port_range_end: 50100
   use_external_ip: false
-  # Laptop LAN IPv4 address on local Wi-Fi network.
-  # Update this if your Wi-Fi router assigns a different IP.
+  # node_ip: fallback value. run-livekit.ps1 automatically passes --node-ip with the active router LAN IP.
   node_ip: "192.168.1.4"
 
 # API keys and secrets for server token verification

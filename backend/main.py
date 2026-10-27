@@ -1,32 +1,55 @@
 import os
+import re
 import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Path, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, and_
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from livekit import api as livekit_api
 
 from database import Base, SessionLocal, check_database_connection, engine
 from models import EmergencyEvent, TrustedContact, CallInvitation, DeviceRegistration
 from signaling import signaling_manager
 from fcm_notifier import send_fcm_call_invitation, init_firebase_admin, get_fcm_status
+from discovery import advertiser, detect_lan_ip
 
 logger = logging.getLogger("aegis")
 
 app = FastAPI(
     title="AEGIS API",
-    description="Emergency Safety and Alert System - Phase 6",
-    version="0.6.0",
+    description="Emergency Safety and Alert System - Phase 8",
+    version="0.8.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 @app.on_event("startup")
-def initialize_database():
+def startup_services():
     Base.metadata.create_all(bind=engine)
     init_firebase_admin()
+    try:
+        advertiser.start()
+    except Exception as e:
+        logger.warning(f"Could not start discovery advertiser: {e}")
+
+
+@app.on_event("shutdown")
+def shutdown_services():
+    try:
+        advertiser.stop()
+    except Exception as e:
+        logger.warning(f"Error stopping discovery advertiser: {e}")
 
 
 # ---------------------------------------------------------
@@ -72,11 +95,51 @@ class CallTokenResponse(BaseModel):
     expires_in_seconds: int
 
 
+def validate_phone_number_format(phone: str | None) -> str:
+    if not phone or not isinstance(phone, str):
+        raise ValueError("Phone number must be a valid non-empty string")
+    clean = phone.strip()
+    if not re.match(r"^\+?[0-9\s\-]{7,20}$", clean):
+        raise ValueError("Invalid phone number format. Allowed characters: digits, spaces, hyphens, optional leading '+'.")
+    digits = [c for c in clean if c.isdigit()]
+    if not (7 <= len(digits) <= 15):
+        raise ValueError(f"Phone number must contain between 7 and 15 digits (got {len(digits)}).")
+    return clean
+
+
+class EmergencyContactUpdateRequest(BaseModel):
+    owner_device_id: str | None = Field(default=None, max_length=100)
+    phone_number: str = Field(min_length=7, max_length=20)
+    contact_name: str | None = Field(default="Phone B", max_length=100)
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        return validate_phone_number_format(v)
+
+
+class EmergencyContactResponse(BaseModel):
+    owner_device_id: str
+    contact_device_id: str
+    contact_name: str | None = None
+    phone_number: str
+    is_configured: bool = True
+    message: str | None = None
+    updated_at: str | None = None
+
+
 class PairContactRequest(BaseModel):
     owner_device_id: str = Field(min_length=1, max_length=100)
     contact_device_id: str = Field(min_length=1, max_length=100)
     contact_name: str | None = Field(default=None, max_length=100)
     contact_phone: str | None = Field(default=None, max_length=50)
+
+    @field_validator("contact_phone")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return validate_phone_number_format(v)
 
 
 class CreateInvitationRequest(BaseModel):
@@ -130,12 +193,30 @@ class FcmTestRequest(BaseModel):
 # Helper Functions
 # ---------------------------------------------------------
 
+def get_resolved_livekit_url() -> str:
+    """
+    Returns the reachable LiveKit WebSocket URL.
+    Dynamically falls back to active laptop LAN IP if LIVEKIT_URL is 'auto'.
+    Respects empty string if explicitly cleared in test environments.
+    """
+    if "LIVEKIT_URL" in os.environ and os.environ["LIVEKIT_URL"] == "":
+        return ""
+    configured = (os.getenv("LIVEKIT_URL") or "").strip()
+    current_ip = detect_lan_ip()
+    if not configured or configured.lower() == "auto":
+        return f"ws://{current_ip}:7880"
+    if "192.168.1.4" in configured and current_ip != "192.168.1.4" and not current_ip.startswith("127."):
+        logger.info(f"Dynamically updating legacy LIVEKIT_URL {configured} to active interface: ws://{current_ip}:7880")
+        return f"ws://{current_ip}:7880"
+    return configured
+
+
 def generate_livekit_token(
     event_id: str,
     device_id: str,
     participant_name: str | None = None,
 ) -> CallTokenResponse:
-    livekit_url = os.getenv("LIVEKIT_URL")
+    livekit_url = get_resolved_livekit_url()
     api_key = os.getenv("LIVEKIT_API_KEY")
     api_secret = os.getenv("LIVEKIT_API_SECRET")
 
@@ -202,8 +283,18 @@ def database_health():
     try:
         check_database_connection()
         return {"database": "connected", "status": "healthy"}
-    except SQLAlchemyError:
+    except (SQLAlchemyError, Exception) as e:
+        logger.warning(f"Database health check failed: {e}")
         raise HTTPException(status_code=503, detail="Database connection failed")
+
+
+@app.get("/api/discovery")
+def get_service_discovery():
+    """
+    Authoritative service discovery endpoint for AEGIS Android clients.
+    Returns active LAN IP, API base URL, and dynamic LiveKit WebSocket URL.
+    """
+    return advertiser.get_discovery_payload()
 
 
 # ---------------------------------------------------------
@@ -266,7 +357,36 @@ def create_emergency(request: SOSRequest):
                 ),
             }
 
-    except SQLAlchemyError:
+    except IntegrityError:
+        # Concurrent request with identical idempotency_key race condition handled gracefully
+        logger.info(f"IntegrityError on create_emergency: retrieving existing event for idempotency_key={request.idempotency_key}")
+        with SessionLocal() as db:
+            existing = db.scalar(
+                select(EmergencyEvent).where(
+                    EmergencyEvent.idempotency_key == request.idempotency_key
+                )
+            )
+            if existing:
+                return {
+                    "event_id": existing.id,
+                    "status": existing.status,
+                    "message": "Emergency event already exists",
+                    "trigger_source": existing.trigger_source,
+                    "latitude": existing.latitude,
+                    "longitude": existing.longitude,
+                    "location_accuracy_meters": existing.location_accuracy_meters,
+                    "location_timestamp": (
+                        existing.location_timestamp.isoformat()
+                        if existing.location_timestamp
+                        else None
+                    ),
+                }
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the emergency event",
+        )
+    except SQLAlchemyError as e:
+        logger.error(f"SQLAlchemyError creating emergency event: {e}")
         raise HTTPException(
             status_code=503,
             detail="Could not save the emergency event",
@@ -274,7 +394,7 @@ def create_emergency(request: SOSRequest):
 
 
 @app.get("/api/emergencies/{event_id}")
-def get_emergency(event_id: str):
+def get_emergency(event_id: str = Path(min_length=1, max_length=64)):
     with SessionLocal() as db:
         event = db.get(EmergencyEvent, event_id)
 
@@ -306,7 +426,7 @@ def get_emergency(event_id: str):
 
 @app.post("/api/calls/token", response_model=CallTokenResponse)
 def get_call_token(request: CallTokenRequest):
-    livekit_url = os.getenv("LIVEKIT_URL")
+    livekit_url = get_resolved_livekit_url()
     api_key = os.getenv("LIVEKIT_API_KEY")
     api_secret = os.getenv("LIVEKIT_API_SECRET")
 
@@ -350,7 +470,7 @@ def get_call_token(request: CallTokenRequest):
 
 
 @app.get("/api/calls/{event_id}")
-def get_call_info(event_id: str):
+def get_call_info(event_id: str = Path(min_length=1, max_length=64)):
     with SessionLocal() as db:
         event = db.get(EmergencyEvent, event_id)
         if event is None:
@@ -389,6 +509,7 @@ def pair_trusted_contact(request: PairContactRequest):
         if existing:
             existing.contact_name = request.contact_name or existing.contact_name
             existing.contact_phone = request.contact_phone or existing.contact_phone
+            existing.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(existing)
             return {
@@ -405,6 +526,8 @@ def pair_trusted_contact(request: PairContactRequest):
             contact_device_id=contact,
             contact_name=request.contact_name,
             contact_phone=request.contact_phone,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
         db.add(new_contact)
         db.commit()
@@ -421,7 +544,7 @@ def pair_trusted_contact(request: PairContactRequest):
 
 
 @app.get("/api/contacts/{device_id}")
-def get_trusted_contacts(device_id: str):
+def get_trusted_contacts(device_id: str = Path(min_length=1, max_length=100)):
     clean_id = device_id.strip()
     with SessionLocal() as db:
         contacts = db.scalars(
@@ -435,9 +558,146 @@ def get_trusted_contacts(device_id: str):
                 "contact_name": c.contact_name,
                 "contact_phone": c.contact_phone,
                 "created_at": c.created_at.isoformat(),
+                "updated_at": c.updated_at.isoformat() if c.updated_at else c.created_at.isoformat(),
             }
             for c in contacts
         ]
+
+
+@app.get("/api/contacts/{owner_device_id}/emergency", response_model=EmergencyContactResponse)
+@app.get("/api/emergency-contact/{owner_device_id}", response_model=EmergencyContactResponse)
+def get_emergency_contact(
+    owner_device_id: str = Path(min_length=1, max_length=100),
+    requesting_device_id: str | None = Header(default=None, alias="X-Device-Id"),
+    device_id: str | None = Query(default=None, max_length=100),
+):
+    clean_owner = owner_device_id.strip()
+    auth_dev = (requesting_device_id or device_id or "").strip()
+    if auth_dev and auth_dev != clean_owner:
+        raise HTTPException(status_code=403, detail="Unauthorized to access this emergency contact")
+
+    with SessionLocal() as db:
+        # Check Phone B pairing first
+        contact = db.scalar(
+            select(TrustedContact).where(
+                and_(
+                    TrustedContact.owner_device_id == clean_owner,
+                    TrustedContact.contact_device_id == "phone-b",
+                )
+            )
+        )
+        if not contact or not contact.contact_phone:
+            # Fall back to any configured contact with a phone number for this device
+            contact = db.scalar(
+                select(TrustedContact).where(
+                    and_(
+                        TrustedContact.owner_device_id == clean_owner,
+                        TrustedContact.contact_phone.is_not(None),
+                    )
+                ).order_by(TrustedContact.created_at.asc())
+            )
+
+        if not contact or not contact.contact_phone:
+            raise HTTPException(status_code=404, detail="Emergency contact not configured")
+
+        return EmergencyContactResponse(
+            owner_device_id=contact.owner_device_id,
+            contact_device_id=contact.contact_device_id,
+            contact_name=contact.contact_name,
+            phone_number=contact.contact_phone,
+            is_configured=True,
+            updated_at=(
+                contact.updated_at.isoformat()
+                if contact.updated_at
+                else contact.created_at.isoformat()
+            ),
+        )
+
+
+def _handle_set_emergency_contact(
+    target_owner: str,
+    request: EmergencyContactUpdateRequest,
+    auth_dev: str = "",
+) -> EmergencyContactResponse:
+    owner = target_owner.strip()
+    clean_auth = auth_dev.strip()
+    if clean_auth and clean_auth != owner:
+        raise HTTPException(status_code=403, detail="Unauthorized to modify this emergency contact")
+
+    if owner == "phone-b":
+        raise HTTPException(status_code=400, detail="Device cannot pair with itself as Phone B emergency contact")
+
+    with SessionLocal() as db:
+        existing = db.scalar(
+            select(TrustedContact).where(
+                and_(
+                    TrustedContact.owner_device_id == owner,
+                    TrustedContact.contact_device_id == "phone-b",
+                )
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        if existing:
+            existing.contact_phone = request.phone_number
+            if request.contact_name:
+                existing.contact_name = request.contact_name
+            existing.updated_at = now
+            db.commit()
+            db.refresh(existing)
+            logger.info(f"Updated Phone B emergency contact for owner '{owner}'")
+            return EmergencyContactResponse(
+                owner_device_id=existing.owner_device_id,
+                contact_device_id=existing.contact_device_id,
+                contact_name=existing.contact_name,
+                phone_number=existing.contact_phone,
+                is_configured=True,
+                message="Emergency contact updated successfully",
+                updated_at=existing.updated_at.isoformat(),
+            )
+
+        new_contact = TrustedContact(
+            owner_device_id=owner,
+            contact_device_id="phone-b",
+            contact_name=request.contact_name or "Phone B",
+            contact_phone=request.phone_number,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(new_contact)
+        db.commit()
+        db.refresh(new_contact)
+        logger.info(f"Created Phone B emergency contact for owner '{owner}'")
+        return EmergencyContactResponse(
+            owner_device_id=new_contact.owner_device_id,
+            contact_device_id=new_contact.contact_device_id,
+            contact_name=new_contact.contact_name,
+            phone_number=new_contact.contact_phone,
+            is_configured=True,
+            message="Emergency contact created successfully",
+            updated_at=new_contact.updated_at.isoformat(),
+        )
+
+
+@app.put("/api/contacts/{owner_device_id}/emergency", response_model=EmergencyContactResponse)
+@app.put("/api/emergency-contact/{owner_device_id}", response_model=EmergencyContactResponse)
+def set_emergency_contact_path(
+    request: EmergencyContactUpdateRequest,
+    owner_device_id: str = Path(min_length=1, max_length=100),
+    requesting_device_id: str | None = Header(default=None, alias="X-Device-Id"),
+):
+    return _handle_set_emergency_contact(owner_device_id, request, requesting_device_id or "")
+
+
+@app.put("/api/emergency-contact", response_model=EmergencyContactResponse)
+@app.post("/api/emergency-contact", response_model=EmergencyContactResponse)
+def set_emergency_contact_body(
+    request: EmergencyContactUpdateRequest,
+    requesting_device_id: str | None = Header(default=None, alias="X-Device-Id"),
+):
+    if not request.owner_device_id:
+        raise HTTPException(status_code=422, detail="owner_device_id is required in request body")
+    return _handle_set_emergency_contact(request.owner_device_id, request, requesting_device_id or "")
 
 
 # ---------------------------------------------------------
@@ -490,13 +750,25 @@ async def create_call_invitation(request: CreateInvitationRequest):
                 and_(
                     CallInvitation.emergency_event_id == event.id,
                     CallInvitation.recipient_device_id == recipient,
-                    CallInvitation.status == "pending",
+                    CallInvitation.status.in_(["pending", "accepted"]),
                 )
-            )
+            ).order_by(CallInvitation.created_at.desc())
         )
 
         if existing_inv:
-            if existing_inv.expires_at > now:
+            if existing_inv.status == "accepted":
+                return {
+                    "id": existing_inv.id,
+                    "emergency_event_id": existing_inv.emergency_event_id,
+                    "caller_device_id": existing_inv.caller_device_id,
+                    "recipient_device_id": existing_inv.recipient_device_id,
+                    "caller_display_name": existing_inv.caller_display_name,
+                    "status": existing_inv.status,
+                    "created_at": existing_inv.created_at.isoformat(),
+                    "expires_at": existing_inv.expires_at.isoformat(),
+                    "message": "Call invitation already accepted and active",
+                }
+            elif existing_inv.expires_at > now:
                 # Still pending and active - return existing invitation
                 return {
                     "id": existing_inv.id,
@@ -585,7 +857,10 @@ async def create_call_invitation(request: CreateInvitationRequest):
 
 
 @app.get("/api/invitations/{invitation_id}")
-def get_call_invitation(invitation_id: str, device_id: str = Query(min_length=1)):
+def get_call_invitation(
+    invitation_id: str = Path(min_length=1, max_length=64),
+    device_id: str = Query(min_length=1, max_length=100),
+):
     clean_dev = device_id.strip()
     with SessionLocal() as db:
         invitation = db.get(CallInvitation, invitation_id)
@@ -617,7 +892,9 @@ def get_call_invitation(invitation_id: str, device_id: str = Query(min_length=1)
 
 
 @app.get("/api/invitations/pending/{recipient_device_id}")
-def get_pending_invitation_for_recipient(recipient_device_id: str):
+def get_pending_invitation_for_recipient(
+    recipient_device_id: str = Path(min_length=1, max_length=100),
+):
     clean_id = recipient_device_id.strip()
     now = datetime.now(timezone.utc)
     with SessionLocal() as db:
@@ -649,7 +926,10 @@ def get_pending_invitation_for_recipient(recipient_device_id: str):
 
 
 @app.post("/api/invitations/{invitation_id}/answer")
-async def answer_call_invitation(invitation_id: str, request: AnswerInvitationRequest):
+async def answer_call_invitation(
+    request: AnswerInvitationRequest,
+    invitation_id: str = Path(min_length=1, max_length=64),
+):
     recipient = request.device_id.strip()
     now = datetime.now(timezone.utc)
 
@@ -738,7 +1018,10 @@ async def answer_call_invitation(invitation_id: str, request: AnswerInvitationRe
 
 
 @app.post("/api/invitations/{invitation_id}/dismiss")
-async def dismiss_call_invitation(invitation_id: str, request: DismissInvitationRequest):
+async def dismiss_call_invitation(
+    request: DismissInvitationRequest,
+    invitation_id: str = Path(min_length=1, max_length=64),
+):
     recipient = request.device_id.strip()
     now = datetime.now(timezone.utc)
 
@@ -782,7 +1065,10 @@ async def dismiss_call_invitation(invitation_id: str, request: DismissInvitation
 
 
 @app.post("/api/invitations/{invitation_id}/cancel")
-async def cancel_call_invitation(invitation_id: str, request: CancelInvitationRequest):
+async def cancel_call_invitation(
+    request: CancelInvitationRequest,
+    invitation_id: str = Path(min_length=1, max_length=64),
+):
     caller = request.device_id.strip()
     now = datetime.now(timezone.utc)
 
@@ -903,6 +1189,9 @@ def fcm_test(request: FcmTestRequest):
 @app.websocket("/api/ws/signaling/{device_id}")
 async def signaling_websocket(websocket: WebSocket, device_id: str):
     clean_id = device_id.strip()
+    if not clean_id or len(clean_id) > 100:
+        await websocket.close(code=1008, reason="Invalid device_id")
+        return
     await signaling_manager.connect(clean_id, websocket)
     try:
         while True:
@@ -942,3 +1231,16 @@ async def signaling_websocket(websocket: WebSocket, device_id: str):
     except Exception as e:
         logger.warning(f"WebSocket error for {clean_id}: {e}")
         signaling_manager.disconnect(clean_id, websocket)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    active_ip = detect_lan_ip()
+    print("=" * 60)
+    print("  Starting AEGIS Backend Server with Auto LAN Discovery")
+    print(f"  Active LAN Interface IP: {active_ip}")
+    print(f"  Binding: http://0.0.0.0:8000 (accessible on LAN: http://{active_ip}:8000)")
+    print(f"  LiveKit Signaling: ws://{active_ip}:7880")
+    print(f"  mDNS Service Type: _aegis._tcp.local.")
+    print("=" * 60)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

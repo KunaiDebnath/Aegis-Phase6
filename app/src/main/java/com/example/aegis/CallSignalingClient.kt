@@ -45,6 +45,7 @@ object CallSignalingClient {
     private var reconnectJob: Job? = null
     private var expiryJob: Job? = null
     private var isStarted = false
+    private var reconnectAttempts = 0
 
     // Observable Compose States
     val currentDeviceId = mutableStateOf("phone-b")
@@ -57,10 +58,10 @@ object CallSignalingClient {
     val callerFeedbackMessage = mutableStateOf<String?>(null)
     val activeOutgoingInvitationId = mutableStateOf<String?>(null)
 
-    fun start(context: Context, deviceId: String = currentDeviceId.value) {
+    fun start(context: Context, deviceId: String? = null) {
         appContext = context.applicationContext
         val savedId = AegisPreferences.getDeviceId(context)
-        val targetId = if (deviceId.isNotBlank()) deviceId else savedId
+        val targetId = if (!deviceId.isNullOrBlank()) deviceId.trim() else savedId
         currentDeviceId.value = targetId
         AegisApiClient.baseUrl = AegisPreferences.getBaseUrl(context)
         isStarted = true
@@ -71,6 +72,7 @@ object CallSignalingClient {
 
     fun stop() {
         isStarted = false
+        reconnectAttempts = 0
         reconnectJob?.cancel()
         reconnectJob = null
         expiryJob?.cancel()
@@ -177,61 +179,84 @@ object CallSignalingClient {
                 .build()
         }
 
-        val request = Request.Builder().url(wsUrl).build()
+        try {
+            val request = Request.Builder().url(wsUrl).build()
 
-        webSocket = okHttpClient!!.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG, "Signaling WebSocket connected as $deviceId")
-                scope.launch {
-                    signalingConnected.value = true
-                    signalingStatusMessage.value = "Signaling: Connected ($deviceId)"
-                    // Check for any pending invitation immediately upon connection
-                    checkPendingInvitations()
-                }
-            }
+            webSocket = okHttpClient!!.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    Log.i(TAG, "Signaling WebSocket connected as $deviceId")
+                    reconnectAttempts = 0
+                    scope.launch {
+                        signalingConnected.value = true
+                        signalingStatusMessage.value = "Signaling: Connected ($deviceId)"
+                        // Check for any pending invitation immediately upon connection
+                        checkPendingInvitations()
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Signaling message received: $text")
-                scope.launch {
-                    handleIncomingMessage(text)
+                        // Resync FCM registration token if previous attempt was offline/standby
+                        val fcmMsg = fcmStatusMessage.value
+                        if (fcmMsg.contains("offline", ignoreCase = true) ||
+                            fcmMsg.contains("failed", ignoreCase = true) ||
+                            fcmMsg.contains("Standby", ignoreCase = true)) {
+                            syncFcmToken(deviceId)
+                        }
+                    }
                 }
-            }
 
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG, "Signaling WebSocket closing: $reason (code $code)")
-                scope.launch {
-                    signalingConnected.value = false
-                    signalingStatusMessage.value = "Signaling: Disconnecting..."
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    Log.d(TAG, "Signaling message received: $text")
+                    scope.launch {
+                        handleIncomingMessage(text)
+                    }
                 }
-            }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.i(TAG, "Signaling WebSocket closed: $reason")
-                scope.launch {
-                    signalingConnected.value = false
-                    signalingStatusMessage.value = "Signaling: Disconnected"
-                    scheduleReconnect()
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    Log.i(TAG, "Signaling WebSocket closing: $reason (code $code)")
+                    scope.launch {
+                        signalingConnected.value = false
+                        signalingStatusMessage.value = "Signaling: Disconnecting..."
+                    }
                 }
-            }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.w(TAG, "Signaling WebSocket failure: ${t.message}")
-                scope.launch {
-                    signalingConnected.value = false
-                    signalingStatusMessage.value = "Signaling offline (${t.message ?: "Network error"})"
-                    scheduleReconnect()
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    Log.i(TAG, "Signaling WebSocket closed: $reason")
+                    scope.launch {
+                        signalingConnected.value = false
+                        signalingStatusMessage.value = "Signaling: Disconnected"
+                        scheduleReconnect()
+                    }
                 }
-            }
-        })
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    Log.w(TAG, "Signaling WebSocket failure: ${t.message}")
+                    scope.launch {
+                        signalingConnected.value = false
+                        signalingStatusMessage.value = "Signaling offline (${t.message ?: "Network error"})"
+                        scheduleReconnect()
+                    }
+                }
+            })
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error initiating WebSocket connection: ${t.message}", t)
+            signalingConnected.value = false
+            signalingStatusMessage.value = "Signaling connection error (${t.message ?: "Network error"})"
+            scheduleReconnect()
+        }
     }
 
     private fun scheduleReconnect() {
         if (!isStarted) return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            delay(5000L) // Safe 5-second backoff
+            reconnectAttempts++
+            val backoffMs = when {
+                reconnectAttempts <= 1 -> 3000L
+                reconnectAttempts == 2 -> 6000L
+                reconnectAttempts == 3 -> 10000L
+                else -> 15000L
+            }
+            delay(backoffMs)
             if (isStarted && !signalingConnected.value) {
-                Log.i(TAG, "Attempting signaling reconnection...")
+                Log.i(TAG, "Attempting signaling reconnection (attempt $reconnectAttempts, backoff ${backoffMs}ms)...")
                 connect(currentDeviceId.value)
             }
         }
@@ -312,6 +337,14 @@ object CallSignalingClient {
     }
 
     fun handleIncomingInvitation(inv: IncomingCallInvitation) {
+        val current = activeIncomingInvitation.value
+        // If this invitation is already active and countdown timer is running,
+        // preserve the running countdown to prevent duplicate push payloads from bouncing the timer.
+        if (current?.invitationId == inv.invitationId && remainingSeconds.value > 0) {
+            Log.d(TAG, "Duplicate incoming invitation ${inv.invitationId} received while active. Preserving countdown timer (${remainingSeconds.value}s).")
+            return
+        }
+
         activeIncomingInvitation.value = inv
         remainingSeconds.value = 60
         startExpiryTimer(inv.invitationId)
@@ -333,6 +366,11 @@ object CallSignalingClient {
             status = "pending"
         )
         handleIncomingInvitation(inv)
+    }
+
+    fun cancelExpiryTimer() {
+        expiryJob?.cancel()
+        expiryJob = null
     }
 
     private fun startExpiryTimer(invitationId: String) {

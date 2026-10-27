@@ -107,6 +107,12 @@ class TrustedContact(Base):
         default=lambda: datetime.now(timezone.utc),
     )
 
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
 
 class CallInvitation(Base):
     __tablename__ = "call_invitations"

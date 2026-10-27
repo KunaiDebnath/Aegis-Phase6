@@ -77,6 +77,22 @@ data class EmergencyLocation(
     }
 }
 
+data class SaveEmergencyContactRequest(
+    val owner_device_id: String,
+    val phone_number: String,
+    val contact_name: String? = "Phone B"
+)
+
+data class EmergencyContactResponse(
+    val owner_device_id: String,
+    val contact_device_id: String,
+    val contact_name: String? = null,
+    val phone_number: String,
+    val is_configured: Boolean = true,
+    val message: String? = null,
+    val updated_at: String? = null
+)
+
 object EmergencyUtils {
     const val DEFAULT_EMERGENCY_PHRASE = "I need help"
 

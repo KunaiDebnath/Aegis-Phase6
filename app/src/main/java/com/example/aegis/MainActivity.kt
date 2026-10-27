@@ -45,10 +45,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -97,8 +100,21 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // Initialize real-time incoming call signaling & restore saved preferences
-        CallSignalingClient.start(this)
+        // Initialize persistent device-specific role manager (frame-0 synchronous restoration)
+        val initialRole = DeviceRoleManager.initialize(this)
+
+        // Automatically discover AEGIS backend server and LiveKit signaling on LAN
+        ServerDiscoveryManager.startDiscovery(this)
+
+        if (initialRole != null) {
+            // Initialize persistent Phone B emergency contact & restore cached preferences
+            EmergencyContactManager.initialize(this, initialRole)
+
+            // Initialize real-time incoming call signaling with the saved device role
+            CallSignalingClient.start(this, initialRole)
+        } else {
+            EmergencyCallNotificationManager.createNotificationChannel(this)
+        }
 
         handleIncomingCallIntent(intent)
 
@@ -115,8 +131,20 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             AEGISTheme {
+                val currentRole = DeviceRoleManager.selectedRole.value
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    AegisMainScreen(paddingValues = padding)
+                    if (currentRole == null) {
+                        RoleSelectionScreen(
+                            onRoleSelected = { role ->
+                                android.util.Log.i("AEGIS_Main", "Device role chosen: $role")
+                            }
+                        )
+                    } else {
+                        AegisMainScreen(
+                            paddingValues = padding,
+                            activeRole = currentRole
+                        )
+                    }
                 }
             }
         }
@@ -178,16 +206,47 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingValues) {
+fun AegisMainScreen(
+    paddingValues: androidx.compose.foundation.layout.PaddingValues,
+    activeRole: String = DeviceRoleManager.selectedRole.value ?: "phone-b"
+) {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
     val clipboardManager = LocalClipboardManager.current
+    val coroutineScope = rememberCoroutineScope()
 
-    var recipientNumberInput by remember { mutableStateOf(EmergencyOrchestrator.emergencyRecipientNumber.value) }
+    var showRoleSwitchWarningDialog by remember { mutableStateOf(false) }
+    var showRoleChangeDialog by remember { mutableStateOf(false) }
+    var pendingRoleSwitchTarget by remember { mutableStateOf<String?>(null) }
+
+    val savedPhone = EmergencyContactManager.savedContactPhone.value
+    val isContactConfigured = EmergencyContactManager.isContactConfigured.value && !savedPhone.isNullOrBlank()
+    val isContactSyncing = EmergencyContactManager.isSyncing.value
+    val contactFeedback = EmergencyContactManager.statusFeedback.value
+    val isContactError = EmergencyContactManager.isError.value
+
+    var isEditMode by remember { mutableStateOf(false) }
+    var phoneInputText by remember { mutableStateOf(savedPhone ?: "") }
+    var contactValidationError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(savedPhone) {
+        if (!isEditMode && !savedPhone.isNullOrBlank()) {
+            phoneInputText = savedPhone
+        }
+    }
+
     var configuredPhraseInput by remember { mutableStateOf(EmergencyOrchestrator.configuredPhrase.value) }
     var responderEventIdInput by remember { mutableStateOf("") }
     var responderValidationError by remember { mutableStateOf<String?>(null) }
     var backendUrlInput by remember { mutableStateOf(AegisApiClient.baseUrl) }
+
+    val discoveredServerUrl = ServerDiscoveryManager.connectedUrl.value
+    LaunchedEffect(discoveredServerUrl) {
+        if (!discoveredServerUrl.isNullOrBlank()) {
+            backendUrlInput = discoveredServerUrl
+        }
+    }
+
     var validationError by remember { mutableStateOf<String?>(null) }
     var showDeliberateRetryDialog by remember { mutableStateOf(false) }
 
@@ -329,6 +388,60 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
         )
 
         Spacer(modifier = Modifier.height(18.dp))
+
+        // Active Role Banner Card with Switcher
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (activeRole == DeviceRoleManager.ROLE_PHONE_A) Color(0xFFFFEBEE) else Color(0xFFE3F2FD)
+            ),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (activeRole == DeviceRoleManager.ROLE_PHONE_A) "ROLE: PHONE A" else "ROLE: PHONE B",
+                        fontWeight = FontWeight.Bold,
+                        color = if (activeRole == DeviceRoleManager.ROLE_PHONE_A) Color(0xFFB71C1C) else Color(0xFF0D47A1),
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = if (activeRole == DeviceRoleManager.ROLE_PHONE_A) "Emergency Requester" else "Trusted Contact Responder",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        val isSessionActive = EmergencyOrchestrator.isSosActive.value ||
+                                LiveKitCallManager.isCallActive ||
+                                CallSignalingClient.activeIncomingInvitation.value != null
+
+                        val otherRole = if (activeRole == DeviceRoleManager.ROLE_PHONE_A) DeviceRoleManager.ROLE_PHONE_B else DeviceRoleManager.ROLE_PHONE_A
+                        pendingRoleSwitchTarget = otherRole
+
+                        if (isSessionActive) {
+                            showRoleSwitchWarningDialog = true
+                        } else {
+                            showRoleChangeDialog = true
+                        }
+                    },
+                    shape = RoundedCornerShape(8.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text("SWITCH ROLE", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Notification Permission Alert (Android 13+)
         if (!hasNotifPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -577,24 +690,50 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val currentDev = CallSignalingClient.currentDeviceId.value
+                    val currentDev = activeRole
                     Button(
-                        onClick = { CallSignalingClient.setDeviceId("phone-a") },
+                        onClick = {
+                            if (activeRole != DeviceRoleManager.ROLE_PHONE_A) {
+                                val isSessionActive = EmergencyOrchestrator.isSosActive.value || LiveKitCallManager.isCallActive
+                                pendingRoleSwitchTarget = DeviceRoleManager.ROLE_PHONE_A
+                                if (isSessionActive) {
+                                    showRoleSwitchWarningDialog = true
+                                } else {
+                                    coroutineScope.launch {
+                                        DeviceRoleManager.switchRoleSafely(context, DeviceRoleManager.ROLE_PHONE_A)
+                                        Toast.makeText(context, "Switched role to PHONE A", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (currentDev == "phone-a") MaterialTheme.colorScheme.primary else Color(0xFF757575)
+                            containerColor = if (currentDev == DeviceRoleManager.ROLE_PHONE_A) MaterialTheme.colorScheme.primary else Color(0xFF757575)
                         )
                     ) {
                         Text("ROLE: PHONE A")
                     }
 
                     Button(
-                        onClick = { CallSignalingClient.setDeviceId("phone-b") },
+                        onClick = {
+                            if (activeRole != DeviceRoleManager.ROLE_PHONE_B) {
+                                val isSessionActive = EmergencyOrchestrator.isSosActive.value || LiveKitCallManager.isCallActive
+                                pendingRoleSwitchTarget = DeviceRoleManager.ROLE_PHONE_B
+                                if (isSessionActive) {
+                                    showRoleSwitchWarningDialog = true
+                                } else {
+                                    coroutineScope.launch {
+                                        DeviceRoleManager.switchRoleSafely(context, DeviceRoleManager.ROLE_PHONE_B)
+                                        Toast.makeText(context, "Switched role to PHONE B", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(8.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (currentDev == "phone-b") MaterialTheme.colorScheme.primary else Color(0xFF757575)
+                            containerColor = if (currentDev == DeviceRoleManager.ROLE_PHONE_B) MaterialTheme.colorScheme.primary else Color(0xFF757575)
                         )
                     ) {
                         Text("ROLE: PHONE B")
@@ -605,40 +744,196 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Recipient Configuration Card
+        // Recipient Configuration Card (Persistent & Editable Phone B Contact)
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-            )
+            ),
+            shape = RoundedCornerShape(12.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "Emergency Recipient (Phone B)",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Emergency Recipient (Phone B)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    if (isContactSyncing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                OutlinedTextField(
-                    value = recipientNumberInput,
-                    onValueChange = {
-                        recipientNumberInput = it
-                        EmergencyOrchestrator.emergencyRecipientNumber.value = it
-                        validationError = null
-                    },
-                    label = { Text("Phone B Number (e.g. +1234567890)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                if (isContactConfigured && !isEditMode) {
+                    // Display Mode: Show saved number + Edit Number button
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "CONFIGURED PHONE B RECIPIENT",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = savedPhone ?: "None",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Persistent in PostgreSQL database & local cache",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
 
-                if (validationError != null) {
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                phoneInputText = savedPhone ?: ""
+                                contactValidationError = null
+                                isEditMode = true
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("EDIT NUMBER")
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch {
+                                    val currentDev = AegisPreferences.getDeviceId(context)
+                                    EmergencyContactManager.refreshAuthoritativeContact(context, currentDev)
+                                }
+                            },
+                            enabled = !isContactSyncing,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("REFRESH")
+                        }
+                    }
+                } else {
+                    // Input / Edit Mode: Show input field + Save button (+ Cancel button if edit mode)
                     Text(
-                        text = validationError!!,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall
+                        text = if (isEditMode) "Change Phone B's emergency number below:" else "Enter Phone B's emergency number to receive SIM-based SMS alerts:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = phoneInputText,
+                        onValueChange = {
+                            phoneInputText = it
+                            contactValidationError = null
+                        },
+                        label = { Text("Phone B Number (e.g. +1234567890)") },
+                        placeholder = { Text("+1234567890") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        isError = contactValidationError != null
+                    )
+
+                    if (contactValidationError != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = contactValidationError!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                if (phoneInputText.isBlank()) {
+                                    contactValidationError = "Please enter Phone B's number."
+                                } else if (!EmergencyUtils.isValidPhoneNumber(phoneInputText)) {
+                                    contactValidationError = "Invalid phone number format. Must contain 7–15 digits."
+                                } else {
+                                    contactValidationError = null
+                                    coroutineScope.launch {
+                                        val currentDev = AegisPreferences.getDeviceId(context)
+                                        val result = EmergencyContactManager.saveEmergencyContact(
+                                            context = context,
+                                            deviceId = currentDev,
+                                            phoneNumber = phoneInputText
+                                        )
+                                        if (result.isSuccess) {
+                                            isEditMode = false
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isContactSyncing,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            if (isContactSyncing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Text(if (isEditMode) "SAVE CHANGES" else "SAVE NUMBER")
+                        }
+
+                        if (isEditMode && isContactConfigured) {
+                            OutlinedButton(
+                                onClick = {
+                                    isEditMode = false
+                                    phoneInputText = savedPhone ?: ""
+                                    contactValidationError = null
+                                },
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("CANCEL")
+                            }
+                        }
+                    }
+                }
+
+                // Feedback status message
+                if (!contactFeedback.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = contactFeedback,
+                        color = if (isContactError) MaterialTheme.colorScheme.error else Color(0xFF2E7D32),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium
                     )
                 }
             }
@@ -726,10 +1021,12 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
                 ) {
                     Button(
                         onClick = {
-                            if (recipientNumberInput.isBlank()) {
-                                validationError = "Configure Phone B's number before enabling voice protection."
-                            } else if (!EmergencyUtils.isValidPhoneNumber(recipientNumberInput)) {
-                                validationError = "Invalid phone number format."
+                            val activeNum = EmergencyContactManager.savedContactPhone.value
+                                ?: EmergencyOrchestrator.emergencyRecipientNumber.value
+                            if (activeNum.isBlank()) {
+                                validationError = "Please configure and save Phone B's emergency number first."
+                            } else if (!EmergencyUtils.isValidPhoneNumber(activeNum)) {
+                                validationError = "Invalid Phone B number. Please edit and save a valid number."
                             } else {
                                 validationError = null
                                 executeWithVoicePermissions {
@@ -769,15 +1066,11 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
         if (!EmergencyOrchestrator.isSosActive.value) {
             Button(
                 onClick = {
-                    if (recipientNumberInput.isBlank()) {
-                        validationError = "Please enter Phone B's number."
-                    } else if (!EmergencyUtils.isValidPhoneNumber(recipientNumberInput)) {
-                        validationError = "Invalid phone number. Include 7 to 15 digits."
-                    } else {
-                        validationError = null
-                        executeWithSosPermissions {
-                            EmergencyOrchestrator.triggerEmergency(context, recipientNumberInput, "manual")
-                        }
+                    val activeNum = EmergencyContactManager.savedContactPhone.value
+                        ?: EmergencyOrchestrator.emergencyRecipientNumber.value
+                    validationError = null
+                    executeWithSosPermissions {
+                        EmergencyOrchestrator.triggerEmergency(context, activeNum, "manual")
                     }
                 },
                 enabled = !EmergencyOrchestrator.isInitiating.value,
@@ -882,7 +1175,7 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
             }
         }
 
-        Spacer(modifier = Modifier.height(18.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Independent Status 1: Location Status Card
         Card(
@@ -1314,7 +1607,7 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Host Network Configuration Card
+        // Automatic Server Discovery & Network Configuration Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -1323,33 +1616,118 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
             shape = RoundedCornerShape(10.dp)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
-                Text(
-                    text = "Backend & LiveKit Host Configuration",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Server Discovery & Host Settings",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    val discState = ServerDiscoveryManager.state.value
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                color = when (discState) {
+                                    DiscoveryState.CONNECTED -> Color(0xFF2E7D32)
+                                    DiscoveryState.DISCOVERING -> Color(0xFF1976D2)
+                                    DiscoveryState.VALIDATING -> Color(0xFFF57C00)
+                                    DiscoveryState.FAILED -> Color(0xFFC62828)
+                                    DiscoveryState.IDLE -> Color(0xFF757575)
+                                },
+                                shape = RoundedCornerShape(6.dp)
+                            )
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = when (discState) {
+                                DiscoveryState.CONNECTED -> "CONNECTED"
+                                DiscoveryState.DISCOVERING -> "DISCOVERING..."
+                                DiscoveryState.VALIDATING -> "VALIDATING"
+                                DiscoveryState.FAILED -> "NOT FOUND"
+                                DiscoveryState.IDLE -> "IDLE"
+                            },
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    text = "Configure laptop LAN IPv4 address (default http://192.168.1.4:8000/). LiveKit server signaling runs on port 7880.",
+                    text = ServerDiscoveryManager.statusMessage.value,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            ServerDiscoveryManager.startDiscovery(context, forceFullDiscovery = true)
+                        },
+                        enabled = !ServerDiscoveryManager.isAutoDiscovering.value,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        if (ServerDiscoveryManager.isAutoDiscovering.value) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text("AUTO DISCOVER", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            coroutineScope.launch {
+                                val success = ServerDiscoveryManager.applyManualEndpoint(context, backendUrlInput)
+                                if (success) {
+                                    Toast.makeText(context, "Server verified and connected!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Server check failed at $backendUrlInput", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        },
+                        enabled = !ServerDiscoveryManager.isAutoDiscovering.value,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("TEST & SAVE", fontSize = 12.sp)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
 
                 OutlinedTextField(
                     value = backendUrlInput,
                     onValueChange = {
                         backendUrlInput = it
-                        AegisApiClient.baseUrl = it
-                        AegisPreferences.setBaseUrl(context, it)
-                        CallSignalingClient.syncFcmToken()
                     },
-                    label = { Text("FastAPI Backend URL") },
+                    label = { Text("Server Base URL (Fallback Override)") },
+                    placeholder = { Text("http://192.168.x.x:8000/") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = "mDNS (_aegis._tcp) and UDP broadcast automatically resolve the laptop's LAN IP when moving between Wi-Fi routers. Manual override is preserved as a fallback.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
                 )
             }
         }
@@ -1382,14 +1760,14 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
 
                 OutlinedButton(
                     onClick = {
-                        if (recipientNumberInput.isBlank()) {
-                            validationError = "Enter Phone B's number for test SMS."
-                        } else if (!EmergencyUtils.isValidPhoneNumber(recipientNumberInput)) {
-                            validationError = "Invalid phone number format."
+                        val activeNum = EmergencyContactManager.savedContactPhone.value
+                            ?: EmergencyOrchestrator.emergencyRecipientNumber.value
+                        if (activeNum.isBlank() || !EmergencyUtils.isValidPhoneNumber(activeNum)) {
+                            validationError = "Save a valid Phone B number first to test SMS."
                         } else {
                             validationError = null
                             executeWithSosPermissions {
-                                EmergencyOrchestrator.sendTestSms(context, recipientNumberInput)
+                                EmergencyOrchestrator.sendTestSms(context, activeNum)
                             }
                         }
                     },
@@ -1430,8 +1808,10 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
                 Button(
                     onClick = {
                         showDeliberateRetryDialog = false
+                        val activeNum = EmergencyContactManager.savedContactPhone.value
+                            ?: EmergencyOrchestrator.emergencyRecipientNumber.value
                         executeWithSosPermissions {
-                            EmergencyOrchestrator.retrySms(context, recipientNumberInput)
+                            EmergencyOrchestrator.retrySms(context, activeNum)
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
@@ -1441,6 +1821,91 @@ fun AegisMainScreen(paddingValues: androidx.compose.foundation.layout.PaddingVal
             },
             dismissButton = {
                 TextButton(onClick = { showDeliberateRetryDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showRoleSwitchWarningDialog) {
+        val targetRole = pendingRoleSwitchTarget ?: (if (activeRole == DeviceRoleManager.ROLE_PHONE_A) DeviceRoleManager.ROLE_PHONE_B else DeviceRoleManager.ROLE_PHONE_A)
+        val targetLabel = if (targetRole == DeviceRoleManager.ROLE_PHONE_A) "PHONE A (Requester)" else "PHONE B (Responder)"
+        AlertDialog(
+            onDismissRequest = {
+                showRoleSwitchWarningDialog = false
+                pendingRoleSwitchTarget = null
+            },
+            title = { Text("Active Emergency Session Alert") },
+            text = {
+                Text(
+                    "An emergency session or audio call is currently active. " +
+                            "Switching to $targetLabel will safely terminate the active call, " +
+                            "cancel ongoing notifications, stop background voice detection, and reconfigure device signaling.\n\n" +
+                            "Do you wish to proceed with switching roles?"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showRoleSwitchWarningDialog = false
+                        coroutineScope.launch {
+                            DeviceRoleManager.switchRoleSafely(context, targetRole)
+                            Toast.makeText(context, "Role switched to $targetLabel", Toast.LENGTH_SHORT).show()
+                            pendingRoleSwitchTarget = null
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                ) {
+                    Text("Terminate & Switch")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showRoleSwitchWarningDialog = false
+                    pendingRoleSwitchTarget = null
+                }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showRoleChangeDialog) {
+        val targetRole = pendingRoleSwitchTarget ?: (if (activeRole == DeviceRoleManager.ROLE_PHONE_A) DeviceRoleManager.ROLE_PHONE_B else DeviceRoleManager.ROLE_PHONE_A)
+        val targetLabel = if (targetRole == DeviceRoleManager.ROLE_PHONE_A) "Phone A (Emergency Requester)" else "Phone B (Trusted Contact Responder)"
+        val description = if (targetRole == DeviceRoleManager.ROLE_PHONE_A) {
+            "This device will be configured to trigger emergency alerts (voice / manual SOS), send emergency SMS with GPS coordinates, and initiate emergency audio calls."
+        } else {
+            "This device will be configured to receive emergency call notifications, display incoming call alerts, and answer audio calls as the trusted contact."
+        }
+        AlertDialog(
+            onDismissRequest = {
+                showRoleChangeDialog = false
+                pendingRoleSwitchTarget = null
+            },
+            title = { Text("Switch Device Role") },
+            text = {
+                Text("Switch device role to $targetLabel?\n\n$description\n\nThis role setting will be persisted on this device across app restarts and reboots.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showRoleChangeDialog = false
+                        coroutineScope.launch {
+                            DeviceRoleManager.switchRoleSafely(context, targetRole)
+                            Toast.makeText(context, "Device role updated to $targetLabel", Toast.LENGTH_SHORT).show()
+                            pendingRoleSwitchTarget = null
+                        }
+                    }
+                ) {
+                    Text("Switch Role")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showRoleChangeDialog = false
+                    pendingRoleSwitchTarget = null
+                }) {
                     Text("Cancel")
                 }
             }

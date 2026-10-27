@@ -72,7 +72,7 @@ object EmergencyOrchestrator {
      */
     fun triggerEmergency(
         context: Context,
-        recipient: String,
+        recipient: String = "",
         source: String = "manual",
         onFinished: (() -> Unit)? = null
     ): Boolean {
@@ -81,11 +81,12 @@ object EmergencyOrchestrator {
             return false
         }
 
-        val targetRecipient = recipient.ifBlank { emergencyRecipientNumber.value }
-        if (targetRecipient.isBlank() || !EmergencyUtils.isValidPhoneNumber(targetRecipient)) {
-            EmergencyTriggerGuard.reset()
-            return false
+        val targetRecipient = recipient.ifBlank {
+            emergencyRecipientNumber.value.ifBlank {
+                EmergencyContactManager.savedContactPhone.value ?: AegisPreferences.getEmergencyContactPhone(context) ?: ""
+            }
         }
+        val hasValidRecipient = targetRecipient.isNotBlank() && EmergencyUtils.isValidPhoneNumber(targetRecipient)
 
         isInitiating.value = true
         isSosActive.value = true
@@ -103,8 +104,13 @@ object EmergencyOrchestrator {
         backendStatus.value = BackendSyncStatus.SENDING
         backendMessage.value = "Sending emergency event to backend ($source)..."
 
-        smsStatus.value = SmsDeliveryStatus.INITIATED
-        smsMessage.value = "Preparing emergency SMS alert ($source)..."
+        if (hasValidRecipient) {
+            smsStatus.value = SmsDeliveryStatus.INITIATED
+            smsMessage.value = "Preparing emergency SMS alert ($source)..."
+        } else {
+            smsStatus.value = SmsDeliveryStatus.SENT_FAILED
+            smsMessage.value = "Emergency contact is not configured. SMS alert could not be dispatched."
+        }
 
         scope.launch {
             val locationProvider = EmergencyLocationProvider(context.applicationContext)
@@ -201,23 +207,29 @@ object EmergencyOrchestrator {
                 backendMessage.value = "Backend unavailable: ${e.message ?: "Network error"}"
             }
 
-            // 3. Attempt SMS dispatch independently (SMS is ALWAYS attempted, even if backend or location failed)
-            try {
-                val emergencyText = EmergencyUtils.buildEmergencySmsMessage(
-                    capturedEventId,
-                    newIdempotencyKey,
-                    acquiredLocation
-                )
-                sendSmsViaTelephony(
-                    context = context.applicationContext,
-                    recipient = targetRecipient,
-                    text = emergencyText,
-                    isTest = false
-                )
-            } catch (e: Exception) {
-                smsStatus.value = SmsDeliveryStatus.SENT_FAILED
-                smsMessage.value = "SMS dispatch failed: ${e.message ?: "Unknown error"}"
-            } finally {
+            // 3. Attempt SMS dispatch independently (only if recipient number is configured)
+            if (hasValidRecipient) {
+                try {
+                    val emergencyText = EmergencyUtils.buildEmergencySmsMessage(
+                        capturedEventId,
+                        newIdempotencyKey,
+                        acquiredLocation
+                    )
+                    sendSmsViaTelephony(
+                        context = context.applicationContext,
+                        recipient = targetRecipient,
+                        text = emergencyText,
+                        isTest = false
+                    )
+                } catch (e: Exception) {
+                    smsStatus.value = SmsDeliveryStatus.SENT_FAILED
+                    smsMessage.value = "SMS dispatch failed: ${e.message ?: "Unknown error"}"
+                } finally {
+                    isInitiating.value = false
+                    EmergencyTriggerGuard.markWorkflowComplete()
+                    onFinished?.invoke()
+                }
+            } else {
                 isInitiating.value = false
                 EmergencyTriggerGuard.markWorkflowComplete()
                 onFinished?.invoke()
@@ -271,13 +283,26 @@ object EmergencyOrchestrator {
                     val locNote = if (loc != null) " (GPS coordinates stored)" else ""
                     backendMessage.value = "Backend: ${body.message}$locNote [Trigger: $source]"
 
+                    val activeCallerId = CallSignalingClient.currentDeviceId.value.ifBlank { "phone-a" }
                     if (!LiveKitCallManager.isCallActive) {
                         try {
                             LiveKitCallManager.startCall(
                                 context = context.applicationContext,
                                 eventId = canonicalEventId,
-                                deviceId = "phone-a",
+                                deviceId = activeCallerId,
                                 displayName = "Phone A (Requester)"
+                            )
+                        } catch (_: Exception) {}
+                    }
+
+                    // Phase 7: Ensure incoming emergency call invitation is dispatched to Phone B upon backend recovery
+                    if (CallSignalingClient.activeOutgoingInvitationId.value == null) {
+                        try {
+                            CallSignalingClient.createInvitation(
+                                emergencyEventId = canonicalEventId,
+                                callerDeviceId = activeCallerId,
+                                recipientDeviceId = "phone-b",
+                                callerDisplayName = "Phone A (Requester)"
                             )
                         } catch (_: Exception) {}
                     }
@@ -297,12 +322,22 @@ object EmergencyOrchestrator {
     /**
      * Explicit deliberate retry of the emergency SMS alert.
      */
-    fun retrySms(context: Context, recipient: String) {
+    fun retrySms(context: Context, recipient: String = "") {
         if (isInitiating.value) return
         val currentKey = currentIdempotencyKey.value
         val eventId = backendEventId.value
         val loc = currentLocation.value
-        val targetRecipient = recipient.ifBlank { emergencyRecipientNumber.value }
+        val targetRecipient = recipient.ifBlank {
+            emergencyRecipientNumber.value.ifBlank {
+                EmergencyContactManager.savedContactPhone.value ?: AegisPreferences.getEmergencyContactPhone(context) ?: ""
+            }
+        }
+
+        if (targetRecipient.isBlank() || !EmergencyUtils.isValidPhoneNumber(targetRecipient)) {
+            smsStatus.value = SmsDeliveryStatus.SENT_FAILED
+            smsMessage.value = "Emergency contact is not configured. Configure Phone B's number first."
+            return
+        }
 
         smsStatus.value = SmsDeliveryStatus.INITIATED
         smsMessage.value = "Deliberate SMS retry initiated..."
@@ -324,8 +359,20 @@ object EmergencyOrchestrator {
     /**
      * Sends non-emergency diagnostic test SMS.
      */
-    fun sendTestSms(context: Context, recipient: String) {
+    fun sendTestSms(context: Context, recipient: String = "") {
         if (isInitiating.value) return
+
+        val targetRecipient = recipient.ifBlank {
+            emergencyRecipientNumber.value.ifBlank {
+                EmergencyContactManager.savedContactPhone.value ?: AegisPreferences.getEmergencyContactPhone(context) ?: ""
+            }
+        }
+
+        if (targetRecipient.isBlank() || !EmergencyUtils.isValidPhoneNumber(targetRecipient)) {
+            testSmsStatus.value = SmsDeliveryStatus.SENT_FAILED
+            testSmsMessage.value = "Emergency contact is not configured. Configure Phone B's number first."
+            return
+        }
 
         testSmsStatus.value = SmsDeliveryStatus.INITIATED
         testSmsMessage.value = "Initiating test SMS..."
@@ -334,7 +381,7 @@ object EmergencyOrchestrator {
             val testText = EmergencyUtils.buildTestSmsMessage()
             sendSmsViaTelephony(
                 context = context.applicationContext,
-                recipient = recipient,
+                recipient = targetRecipient,
                 text = testText,
                 isTest = true
             )
@@ -351,6 +398,9 @@ object EmergencyOrchestrator {
         try {
             LiveKitCallManager.endCall()
         } catch (_: Exception) {}
+
+        CallSignalingClient.activeOutgoingInvitationId.value = null
+        CallSignalingClient.callerFeedbackMessage.value = null
 
         EmergencyTriggerGuard.reset()
         isSosActive.value = false
