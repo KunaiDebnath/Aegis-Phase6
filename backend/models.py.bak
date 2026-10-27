@@ -1,0 +1,48 @@
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import String, DateTime
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class EmergencyEvent(Base):
+    __tablename__ = "emergency_events"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    device_id: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    trigger_source: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="manual",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="active",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

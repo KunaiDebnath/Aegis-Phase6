@@ -1,0 +1,1090 @@
+package com.example.aegis
+
+import android.Manifest
+import android.app.Activity
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.telephony.SmsManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.example.aegis.ui.theme.AEGISTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+
+class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val ACTION_SMS_SENT = "com.example.aegis.ACTION_SMS_SENT"
+        const val ACTION_SMS_DELIVERED = "com.example.aegis.ACTION_SMS_DELIVERED"
+        const val EXTRA_IS_TEST = "com.example.aegis.EXTRA_IS_TEST"
+        const val EXTRA_ATTEMPT_ID = "com.example.aegis.EXTRA_ATTEMPT_ID"
+    }
+
+    private val pendingIntentCounter = AtomicInteger(100)
+    private lateinit var locationProvider: EmergencyLocationProvider
+
+    // Reactive Compose states managed at Activity level
+    private var isSosActiveState = mutableStateOf(false)
+    private var isInitiatingState = mutableStateOf(false)
+    private var currentIdempotencyKeyState = mutableStateOf("")
+    private var backendEventIdState = mutableStateOf<String?>(null)
+
+    // Location States
+    private var locationStatusState = mutableStateOf(LocationAcquisitionStatus.IDLE)
+    private var locationMessageState = mutableStateOf("Location ready. Awaiting SOS trigger.")
+    private var currentLocationState = mutableStateOf<EmergencyLocation?>(null)
+    private var isLocationStaleState = mutableStateOf(false)
+
+    // Backend States
+    private var backendStatusState = mutableStateOf(BackendSyncStatus.IDLE)
+    private var backendMessageState = mutableStateOf("Backend ready for emergency monitoring.")
+
+    // SMS States
+    private var smsStatusState = mutableStateOf(SmsDeliveryStatus.IDLE)
+    private var smsMessageState = mutableStateOf("SMS ready. No emergency sent.")
+    private var lastSmsContentState = mutableStateOf("")
+
+    // Diagnostic SIM Test States
+    private var testSmsStatusState = mutableStateOf(SmsDeliveryStatus.IDLE)
+    private var testSmsMessageState = mutableStateOf("SIM test ready.")
+
+    // BroadcastReceiver for tracking sent and delivered SMS intents
+    private val smsStatusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
+            val isTest = intent.getBooleanExtra(EXTRA_IS_TEST, false)
+
+            when (intent.action) {
+                ACTION_SMS_SENT -> {
+                    val code = resultCode
+                    val (status, msg) = when (code) {
+                        Activity.RESULT_OK -> {
+                            SmsDeliveryStatus.SENT_SUCCESS to "SMS sent successfully reported by Android carrier network."
+                        }
+                        SmsManager.RESULT_ERROR_NO_SERVICE -> {
+                            SmsDeliveryStatus.SENT_FAILED to "SMS send failed: No cellular service available."
+                        }
+                        SmsManager.RESULT_ERROR_RADIO_OFF -> {
+                            SmsDeliveryStatus.SENT_FAILED to "SMS send failed: Radio is turned off (airplane mode)."
+                        }
+                        SmsManager.RESULT_ERROR_GENERIC_FAILURE -> {
+                            SmsDeliveryStatus.SENT_FAILED to "SMS send failed: Telephony generic failure."
+                        }
+                        SmsManager.RESULT_ERROR_NULL_PDU -> {
+                            SmsDeliveryStatus.SENT_FAILED to "SMS send failed: Null PDU error."
+                        }
+                        else -> {
+                            SmsDeliveryStatus.SENT_FAILED to "SMS send failed with Android error code: $code."
+                        }
+                    }
+
+                    if (isTest) {
+                        testSmsStatusState.value = status
+                        testSmsMessageState.value = "[Test] $msg"
+                    } else {
+                        smsStatusState.value = status
+                        smsMessageState.value = msg
+                    }
+                }
+
+                ACTION_SMS_DELIVERED -> {
+                    val code = resultCode
+                    if (code == Activity.RESULT_OK) {
+                        if (isTest) {
+                            testSmsStatusState.value = SmsDeliveryStatus.DELIVERED
+                            testSmsMessageState.value = "[Test] SMS delivered to recipient (delivery confirmed)."
+                        } else {
+                            smsStatusState.value = SmsDeliveryStatus.DELIVERED
+                            smsMessageState.value = "SMS delivered to recipient (delivery confirmed)."
+                        }
+                    } else {
+                        val failMsg = "Delivery report: Not delivered or unconfirmed by network (code: $code)."
+                        if (isTest) {
+                            testSmsStatusState.value = SmsDeliveryStatus.DELIVERY_FAILED
+                            testSmsMessageState.value = "[Test] $failMsg"
+                        } else {
+                            smsStatusState.value = SmsDeliveryStatus.DELIVERY_FAILED
+                            smsMessageState.value = failMsg
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        locationProvider = EmergencyLocationProvider(this)
+
+        // Register SMS broadcast receiver for sent and delivery feedback
+        val filter = IntentFilter().apply {
+            addAction(ACTION_SMS_SENT)
+            addAction(ACTION_SMS_DELIVERED)
+        }
+        ContextCompat.registerReceiver(
+            this,
+            smsStatusReceiver,
+            filter,
+            ContextCompat.RECEIVER_EXPORTED
+        )
+
+        setContent {
+            AEGISTheme {
+                Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
+                    AegisEmergencyScreen(
+                        paddingValues = padding,
+                        isSosActive = isSosActiveState.value,
+                        isInitiating = isInitiatingState.value,
+                        idempotencyKey = currentIdempotencyKeyState.value,
+                        locationStatus = locationStatusState.value,
+                        locationMessage = locationMessageState.value,
+                        currentLocation = currentLocationState.value,
+                        isLocationStale = isLocationStaleState.value,
+                        backendEventId = backendEventIdState.value,
+                        backendStatus = backendStatusState.value,
+                        backendMessage = backendMessageState.value,
+                        smsStatus = smsStatusState.value,
+                        smsMessage = smsMessageState.value,
+                        lastSmsContent = lastSmsContentState.value,
+                        testSmsStatus = testSmsStatusState.value,
+                        testSmsMessage = testSmsMessageState.value,
+                        onTriggerSos = { number -> triggerSosWorkflow(number) },
+                        onRetryBackend = { retryBackendWorkflow() },
+                        onRetrySms = { number -> retrySmsWorkflow(number) },
+                        onStartNewEvent = { startNewSosEvent() },
+                        onSendTestSms = { number -> triggerTestSmsWorkflow(number) }
+                    )
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            unregisterReceiver(smsStatusReceiver)
+        } catch (_: Exception) {
+            // Already unregistered
+        }
+    }
+
+    /**
+     * Phase 3 Integrated SOS Workflow:
+     * 1. Generates unique idempotency key for this emergency.
+     * 2. Attempts to acquire fresh GPS location fix (with 7s timeout).
+     * 3. Sends emergency event to backend with coordinates (when available).
+     * 4. Independently dispatches emergency SMS to Phone B with Google Maps link (when coordinates available)
+     *    or without map link (when location unavailable).
+     * 5. Never lets location or backend failure prevent the emergency SMS attempt.
+     */
+    private fun triggerSosWorkflow(recipientNumber: String) {
+        if (isInitiatingState.value) return // Prevent rapid taps
+        isInitiatingState.value = true
+        isSosActiveState.value = true
+
+        val newIdempotencyKey = UUID.randomUUID().toString()
+        currentIdempotencyKeyState.value = newIdempotencyKey
+        backendEventIdState.value = null
+
+        locationStatusState.value = LocationAcquisitionStatus.ACQUIRING
+        locationMessageState.value = "Acquiring GPS location fix..."
+        currentLocationState.value = null
+        isLocationStaleState.value = false
+
+        backendStatusState.value = BackendSyncStatus.SENDING
+        backendMessageState.value = "Sending emergency event to backend..."
+
+        smsStatusState.value = SmsDeliveryStatus.INITIATED
+        smsMessageState.value = "Preparing emergency SMS alert..."
+
+        lifecycleScope.launch {
+            var acquiredLocation: EmergencyLocation? = null
+
+            // 1. Attempt GPS Location acquisition
+            try {
+                when (val result = locationProvider.getCurrentLocation(timeoutMillis = 7000L)) {
+                    is LocationResult.Success -> {
+                        acquiredLocation = result.location
+                        currentLocationState.value = acquiredLocation
+                        isLocationStaleState.value = !result.isFresh
+                        locationStatusState.value = LocationAcquisitionStatus.SUCCESS
+                        val accuracyText = acquiredLocation.accuracyMeters?.let { " (±${it.toInt()}m)" } ?: ""
+                        val fixType = if (result.isFresh) "Fresh GPS fix" else "Recent location (<5m)"
+                        locationMessageState.value = "Lat: ${acquiredLocation.latitude}, Lng: ${acquiredLocation.longitude}$accuracyText [$fixType]"
+                    }
+                    is LocationResult.Timeout -> {
+                        locationStatusState.value = LocationAcquisitionStatus.TIMEOUT
+                        locationMessageState.value = "GPS acquisition timed out (7s). Proceeding without location."
+                    }
+                    is LocationResult.Unavailable -> {
+                        locationStatusState.value = LocationAcquisitionStatus.UNAVAILABLE
+                        locationMessageState.value = "Location unavailable: ${result.reason} Proceeding without location."
+                    }
+                    is LocationResult.PermissionDenied -> {
+                        locationStatusState.value = LocationAcquisitionStatus.PERMISSION_DENIED
+                        locationMessageState.value = "Location permission denied. Proceeding without location."
+                    }
+                }
+            } catch (e: Exception) {
+                locationStatusState.value = LocationAcquisitionStatus.UNAVAILABLE
+                locationMessageState.value = "Location error: ${e.message ?: "Unknown error"}. Proceeding without location."
+            }
+
+            // 2. Attempt Backend Synchronization (with location if available)
+            var capturedEventId: String? = null
+            try {
+                val timestampIso = acquiredLocation?.let {
+                    val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+                    sdf.timeZone = TimeZone.getTimeZone("UTC")
+                    sdf.format(Date(it.timestamp))
+                }
+
+                val response = withContext(Dispatchers.IO) {
+                    AegisApiClient.api.createEmergency(
+                        SOSRequest(
+                            device_id = "phone-a",
+                            idempotency_key = newIdempotencyKey,
+                            trigger_source = "manual",
+                            latitude = acquiredLocation?.latitude,
+                            longitude = acquiredLocation?.longitude,
+                            location_accuracy_meters = acquiredLocation?.accuracyMeters,
+                            location_timestamp = timestampIso
+                        )
+                    )
+                }
+
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    capturedEventId = body.event_id
+                    backendEventIdState.value = body.event_id
+                    backendStatusState.value = BackendSyncStatus.RECORDED
+                    val locNote = if (acquiredLocation != null) " (GPS coordinates stored)" else " (without location)"
+                    backendMessageState.value = "Backend: ${body.message}$locNote"
+                } else {
+                    backendStatusState.value = BackendSyncStatus.FAILED
+                    backendMessageState.value = "Backend returned HTTP ${response.code()}"
+                }
+            } catch (e: Exception) {
+                backendStatusState.value = BackendSyncStatus.FAILED
+                backendMessageState.value = "Backend unavailable: ${e.message ?: "Network error"}"
+            }
+
+            // 3. Attempt SMS dispatch independently (SMS is ALWAYS attempted, even if backend or location failed)
+            try {
+                val emergencyText = EmergencyUtils.buildEmergencySmsMessage(
+                    capturedEventId,
+                    newIdempotencyKey,
+                    acquiredLocation
+                )
+                sendSmsViaTelephony(
+                    recipient = recipientNumber,
+                    text = emergencyText,
+                    isTest = false
+                )
+            } catch (e: Exception) {
+                smsStatusState.value = SmsDeliveryStatus.SENT_FAILED
+                smsMessageState.value = "SMS dispatch failed: ${e.message ?: "Unknown error"}"
+            } finally {
+                isInitiatingState.value = false
+            }
+        }
+    }
+
+    /**
+     * Retry Backend Synchronization: Strictly reuses the SAME idempotency key
+     * and previously acquired location for this emergency.
+     * Does NOT re-send SMS.
+     */
+    private fun retryBackendWorkflow() {
+        val currentKey = currentIdempotencyKeyState.value
+        if (isInitiatingState.value || currentKey.isBlank()) return
+
+        isInitiatingState.value = true
+        backendStatusState.value = BackendSyncStatus.SENDING
+        backendMessageState.value = "Retrying backend event synchronization..."
+
+        val loc = currentLocationState.value
+
+        lifecycleScope.launch {
+            try {
+                val timestampIso = loc?.let {
+                    val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+                    sdf.timeZone = TimeZone.getTimeZone("UTC")
+                    sdf.format(Date(it.timestamp))
+                }
+
+                val response = withContext(Dispatchers.IO) {
+                    AegisApiClient.api.createEmergency(
+                        SOSRequest(
+                            device_id = "phone-a",
+                            idempotency_key = currentKey, // REUSING SAME KEY
+                            trigger_source = "manual",
+                            latitude = loc?.latitude,
+                            longitude = loc?.longitude,
+                            location_accuracy_meters = loc?.accuracyMeters,
+                            location_timestamp = timestampIso
+                        )
+                    )
+                }
+
+                if (response.isSuccessful && response.body() != null) {
+                    val body = response.body()!!
+                    backendEventIdState.value = body.event_id
+                    backendStatusState.value = BackendSyncStatus.RECORDED
+                    val locNote = if (loc != null) " (GPS coordinates stored)" else ""
+                    backendMessageState.value = "Backend: ${body.message}$locNote"
+                } else {
+                    backendStatusState.value = BackendSyncStatus.FAILED
+                    backendMessageState.value = "Backend returned HTTP ${response.code()}"
+                }
+            } catch (e: Exception) {
+                backendStatusState.value = BackendSyncStatus.FAILED
+                backendMessageState.value = "Backend unavailable: ${e.message ?: "Network error"}"
+            } finally {
+                isInitiatingState.value = false
+            }
+        }
+    }
+
+    /**
+     * Deliberate Retry of Emergency SMS: Called after explicit user confirmation in UI.
+     */
+    private fun retrySmsWorkflow(recipientNumber: String) {
+        if (isInitiatingState.value) return
+        val currentKey = currentIdempotencyKeyState.value
+        val eventId = backendEventIdState.value
+        val loc = currentLocationState.value
+
+        smsStatusState.value = SmsDeliveryStatus.INITIATED
+        smsMessageState.value = "Deliberate SMS retry initiated..."
+
+        try {
+            val text = EmergencyUtils.buildEmergencySmsMessage(eventId, currentKey, loc)
+            sendSmsViaTelephony(
+                recipient = recipientNumber,
+                text = text,
+                isTest = false
+            )
+        } catch (e: Exception) {
+            smsStatusState.value = SmsDeliveryStatus.SENT_FAILED
+            smsMessageState.value = "SMS retry failed: ${e.message ?: "Unknown error"}"
+        }
+    }
+
+    /**
+     * Trigger Non-Emergency Test SMS: clearly labeled, does not contact backend or acquire location.
+     */
+    private fun triggerTestSmsWorkflow(recipientNumber: String) {
+        if (isInitiatingState.value) return
+
+        testSmsStatusState.value = SmsDeliveryStatus.INITIATED
+        testSmsMessageState.value = "Initiating test SMS..."
+
+        try {
+            val testText = EmergencyUtils.buildTestSmsMessage()
+            sendSmsViaTelephony(
+                recipient = recipientNumber,
+                text = testText,
+                isTest = true
+            )
+        } catch (e: Exception) {
+            testSmsStatusState.value = SmsDeliveryStatus.SENT_FAILED
+            testSmsMessageState.value = "Test SMS failed: ${e.message ?: "Unknown error"}"
+        }
+    }
+
+    /**
+     * Resets the active emergency session and clears states for a fresh event.
+     */
+    private fun startNewSosEvent() {
+        isSosActiveState.value = false
+        isInitiatingState.value = false
+        currentIdempotencyKeyState.value = ""
+        backendEventIdState.value = null
+
+        locationStatusState.value = LocationAcquisitionStatus.IDLE
+        locationMessageState.value = "Location ready. Awaiting SOS trigger."
+        currentLocationState.value = null
+        isLocationStaleState.value = false
+
+        backendStatusState.value = BackendSyncStatus.IDLE
+        backendMessageState.value = "Backend ready for emergency monitoring."
+
+        smsStatusState.value = SmsDeliveryStatus.IDLE
+        smsMessageState.value = "SMS ready. No emergency sent."
+        lastSmsContentState.value = ""
+    }
+
+    /**
+     * Telephony dispatch with unique PendingIntents for sent & delivery tracking.
+     */
+    private fun sendSmsViaTelephony(recipient: String, text: String, isTest: Boolean) {
+        val cleanRecipient = recipient.trim()
+        val attemptId = pendingIntentCounter.incrementAndGet()
+
+        val sentIntent = PendingIntent.getBroadcast(
+            this,
+            attemptId * 2,
+            Intent(ACTION_SMS_SENT).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_ATTEMPT_ID, attemptId)
+                putExtra(EXTRA_IS_TEST, isTest)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val deliveryIntent = PendingIntent.getBroadcast(
+            this,
+            attemptId * 2 + 1,
+            Intent(ACTION_SMS_DELIVERED).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_ATTEMPT_ID, attemptId)
+                putExtra(EXTRA_IS_TEST, isTest)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            getSystemService(SmsManager::class.java)
+                ?: throw IllegalStateException("SMS service is unavailable on this device.")
+        } else {
+            @Suppress("DEPRECATION")
+            SmsManager.getDefault()
+        }
+
+        val parts = smsManager.divideMessage(text)
+        if (parts.size > 1) {
+            val sentIntents = ArrayList<PendingIntent>()
+            val deliveryIntents = ArrayList<PendingIntent>()
+            for (i in parts.indices) {
+                sentIntents.add(sentIntent)
+                deliveryIntents.add(deliveryIntent)
+            }
+            smsManager.sendMultipartTextMessage(
+                cleanRecipient,
+                null,
+                parts,
+                sentIntents,
+                deliveryIntents
+            )
+        } else {
+            smsManager.sendTextMessage(
+                cleanRecipient,
+                null,
+                text,
+                sentIntent,
+                deliveryIntent
+            )
+        }
+
+        if (isTest) {
+            testSmsStatusState.value = SmsDeliveryStatus.ACCEPTED_BY_TELEPHONY
+            testSmsMessageState.value = "[Test] SMS accepted by telephony service. Radio transmitting..."
+        } else {
+            smsStatusState.value = SmsDeliveryStatus.ACCEPTED_BY_TELEPHONY
+            smsMessageState.value = "SMS accepted by telephony service. Waiting for radio transmission..."
+            lastSmsContentState.value = text
+        }
+    }
+}
+
+@Composable
+fun AegisEmergencyScreen(
+    paddingValues: androidx.compose.foundation.layout.PaddingValues,
+    isSosActive: Boolean,
+    isInitiating: Boolean,
+    idempotencyKey: String,
+    locationStatus: LocationAcquisitionStatus,
+    locationMessage: String,
+    currentLocation: EmergencyLocation?,
+    isLocationStale: Boolean,
+    backendEventId: String?,
+    backendStatus: BackendSyncStatus,
+    backendMessage: String,
+    smsStatus: SmsDeliveryStatus,
+    smsMessage: String,
+    lastSmsContent: String,
+    testSmsStatus: SmsDeliveryStatus,
+    testSmsMessage: String,
+    onTriggerSos: (String) -> Unit,
+    onRetryBackend: () -> Unit,
+    onRetrySms: (String) -> Unit,
+    onStartNewEvent: () -> Unit,
+    onSendTestSms: (String) -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val uriHandler = LocalUriHandler.current
+
+    var recipientNumber by remember { mutableStateOf("") }
+    var validationError by remember { mutableStateOf<String?>(null) }
+    var showDeliberateRetryDialog by remember { mutableStateOf(false) }
+    var pendingActionAfterPermission by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    // Multi-permission launcher for SMS + Fine & Coarse Location
+    val permissionsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val smsGranted = permissions[Manifest.permission.SEND_SMS] == true
+        if (smsGranted) {
+            pendingActionAfterPermission?.invoke()
+        } else {
+            validationError = "SEND_SMS permission is required to send emergency alerts."
+        }
+        pendingActionAfterPermission = null
+    }
+
+    fun executeWithPermissions(action: () -> Unit) {
+        val hasSms = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.SEND_SMS
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val hasFineLoc = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val hasCoarseLoc = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (hasSms && (hasFineLoc || hasCoarseLoc)) {
+            action()
+        } else {
+            pendingActionAfterPermission = action
+            permissionsLauncher.launch(
+                arrayOf(
+                    Manifest.permission.SEND_SMS,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(paddingValues)
+            .padding(horizontal = 20.dp, vertical = 16.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // App Header
+        Text(
+            text = "AEGIS",
+            style = MaterialTheme.typography.headlineLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+            text = "Your Voice. Your Safety. Your Lifeline.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Recipient Configuration
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            )
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Emergency Recipient (Phone B)",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = recipientNumber,
+                    onValueChange = {
+                        recipientNumber = it
+                        validationError = null
+                    },
+                    label = { Text("Phone B Number (e.g. +1234567890)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                if (validationError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = validationError!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Emergency SOS Trigger Area
+        if (!isSosActive) {
+            Button(
+                onClick = {
+                    if (recipientNumber.isBlank()) {
+                        validationError = "Please enter Phone B's number."
+                    } else if (!EmergencyUtils.isValidPhoneNumber(recipientNumber)) {
+                        validationError = "Invalid phone number. Include 7 to 15 digits."
+                    } else {
+                        validationError = null
+                        executeWithPermissions {
+                            onTriggerSos(recipientNumber)
+                        }
+                    }
+                },
+                enabled = !isInitiating,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFD32F2F),
+                    contentColor = Color.White
+                )
+            ) {
+                if (isInitiating) {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("TRIGGERING SOS & GPS...", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                } else {
+                    Text("TRIGGER EMERGENCY SOS", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                }
+            }
+        } else {
+            // Active SOS Session Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color(0xFFFFEBEE)
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "EMERGENCY ALERT TRIGGERED",
+                        color = Color(0xFFC62828),
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = "Idempotency Ref: ${idempotencyKey.take(12)}...",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF37474F)
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = onStartNewEvent,
+                            enabled = !isInitiating,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("NEW SOS EVENT")
+                        }
+
+                        if (backendStatus == BackendSyncStatus.FAILED) {
+                            OutlinedButton(
+                                onClick = onRetryBackend,
+                                enabled = !isInitiating,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("RETRY BACKEND")
+                            }
+                        }
+
+                        if (smsStatus == SmsDeliveryStatus.SENT_FAILED || smsStatus == SmsDeliveryStatus.DELIVERY_FAILED) {
+                            OutlinedButton(
+                                onClick = { showDeliberateRetryDialog = true },
+                                enabled = !isInitiating,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("RETRY SMS")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Independent Status 1: Location Status
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+            ),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "1. Emergency GPS Location",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                color = when (locationStatus) {
+                                    LocationAcquisitionStatus.IDLE -> Color(0xFF757575)
+                                    LocationAcquisitionStatus.ACQUIRING -> Color(0xFF1976D2)
+                                    LocationAcquisitionStatus.SUCCESS -> Color(0xFF2E7D32)
+                                    LocationAcquisitionStatus.UNAVAILABLE -> Color(0xFFF57C00)
+                                    LocationAcquisitionStatus.TIMEOUT -> Color(0xFFE65100)
+                                    LocationAcquisitionStatus.PERMISSION_DENIED -> Color(0xFFC62828)
+                                },
+                                shape = RoundedCornerShape(6.dp)
+                            )
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = when (locationStatus) {
+                                LocationAcquisitionStatus.IDLE -> "IDLE"
+                                LocationAcquisitionStatus.ACQUIRING -> "ACQUIRING..."
+                                LocationAcquisitionStatus.SUCCESS -> if (isLocationStale) "ACQUIRED (CACHED)" else "ACQUIRED (FRESH)"
+                                LocationAcquisitionStatus.UNAVAILABLE -> "UNAVAILABLE"
+                                LocationAcquisitionStatus.TIMEOUT -> "TIMEOUT"
+                                LocationAcquisitionStatus.PERMISSION_DENIED -> "PERMISSION DENIED"
+                            },
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = locationMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                if (currentLocation != null && currentLocation.isValid()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        text = "Backend status: " + when (backendStatus) {
+                            BackendSyncStatus.RECORDED -> "Coordinates stored in database"
+                            BackendSyncStatus.FAILED -> "Local fix only (backend offline)"
+                            BackendSyncStatus.SENDING -> "Transmitting to backend..."
+                            BackendSyncStatus.IDLE -> "Not uploaded"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                uriHandler.openUri(currentLocation.toGoogleMapsUrl())
+                            } catch (_: Exception) {}
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("OPEN COORDINATES IN GOOGLE MAPS")
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Independent Status 2: Backend Database Status
+        StatusCard(
+            title = "2. Backend Database Status",
+            badgeText = when (backendStatus) {
+                BackendSyncStatus.IDLE -> "IDLE"
+                BackendSyncStatus.SENDING -> "TRANSMITTING"
+                BackendSyncStatus.RECORDED -> "SAVED (201)"
+                BackendSyncStatus.FAILED -> "FAILED"
+            },
+            badgeColor = when (backendStatus) {
+                BackendSyncStatus.IDLE -> Color(0xFF757575)
+                BackendSyncStatus.SENDING -> Color(0xFF1976D2)
+                BackendSyncStatus.RECORDED -> Color(0xFF2E7D32)
+                BackendSyncStatus.FAILED -> Color(0xFFC62828)
+            },
+            detailMessage = backendMessage,
+            additionalInfo = if (!backendEventId.isNullOrBlank()) "Event ID: $backendEventId" else null
+        )
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Independent Status 3: SMS Delivery Status
+        StatusCard(
+            title = "3. Phone A -> Phone B SMS Alert",
+            badgeText = when (smsStatus) {
+                SmsDeliveryStatus.IDLE -> "IDLE"
+                SmsDeliveryStatus.INITIATED -> "1. INITIATED"
+                SmsDeliveryStatus.ACCEPTED_BY_TELEPHONY -> "2. ACCEPTED BY TELEPHONY"
+                SmsDeliveryStatus.SENT_SUCCESS -> "3. SENT (CARRIER OK)"
+                SmsDeliveryStatus.SENT_FAILED -> "SEND FAILED"
+                SmsDeliveryStatus.DELIVERED -> "4. DELIVERED"
+                SmsDeliveryStatus.DELIVERY_FAILED -> "DELIVERY UNCONFIRMED"
+            },
+            badgeColor = when (smsStatus) {
+                SmsDeliveryStatus.IDLE -> Color(0xFF757575)
+                SmsDeliveryStatus.INITIATED -> Color(0xFF0288D1)
+                SmsDeliveryStatus.ACCEPTED_BY_TELEPHONY -> Color(0xFFF57C00)
+                SmsDeliveryStatus.SENT_SUCCESS -> Color(0xFF388E3C)
+                SmsDeliveryStatus.SENT_FAILED -> Color(0xFFD32F2F)
+                SmsDeliveryStatus.DELIVERED -> Color(0xFF1B5E20)
+                SmsDeliveryStatus.DELIVERY_FAILED -> Color(0xFFE65100)
+            },
+            detailMessage = smsMessage,
+            additionalInfo = if (lastSmsContent.isNotBlank()) "Dispatched: \"$lastSmsContent\"" else null
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+        HorizontalDivider()
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Separated Non-Emergency Test SMS Section
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            )
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    text = "SIM Transmission Diagnostics",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Text(
+                    text = "Send a non-emergency test SMS to verify SIM connection without creating backend records or acquiring GPS.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                OutlinedButton(
+                    onClick = {
+                        if (recipientNumber.isBlank()) {
+                            validationError = "Enter Phone B's number for test SMS."
+                        } else if (!EmergencyUtils.isValidPhoneNumber(recipientNumber)) {
+                            validationError = "Invalid phone number format."
+                        } else {
+                            validationError = null
+                            executeWithPermissions {
+                                onSendTestSms(recipientNumber)
+                            }
+                        }
+                    },
+                    enabled = !isInitiating,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("SEND NON-EMERGENCY TEST SMS")
+                }
+
+                if (testSmsStatus != SmsDeliveryStatus.IDLE) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = testSmsMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when (testSmsStatus) {
+                            SmsDeliveryStatus.SENT_FAILED, SmsDeliveryStatus.DELIVERY_FAILED -> Color(0xFFD32F2F)
+                            SmsDeliveryStatus.DELIVERED -> Color(0xFF2E7D32)
+                            else -> MaterialTheme.colorScheme.onSurface
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    // Deliberate SMS Retry Confirmation Dialog
+    if (showDeliberateRetryDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeliberateRetryDialog = false },
+            title = { Text("Confirm Emergency SMS Resend") },
+            text = {
+                Text(
+                    "Warning: The previous SMS may have already been transmitted over the carrier network. " +
+                            "Resending may result in a duplicate emergency SMS delivered to Phone B. " +
+                            "Do you wish to proceed with a deliberate resend?"
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeliberateRetryDialog = false
+                        executeWithPermissions {
+                            onRetrySms(recipientNumber)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                ) {
+                    Text("Confirm Resend")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeliberateRetryDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun StatusCard(
+    title: String,
+    badgeText: String,
+    badgeColor: Color,
+    detailMessage: String,
+    additionalInfo: String?
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        ),
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Box(
+                    modifier = Modifier
+                        .background(badgeColor, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = badgeText,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = detailMessage,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+
+            if (!additionalInfo.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = additionalInfo,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}

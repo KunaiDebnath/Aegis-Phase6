@@ -1,0 +1,67 @@
+package com.example.aegis
+
+/**
+ * Represents the status of the emergency backend synchronization.
+ */
+enum class BackendSyncStatus {
+    IDLE,
+    SENDING,
+    RECORDED,
+    FAILED
+}
+
+/**
+ * Represents the 4-phase status of the SMS emergency alert delivery:
+ * 1. INITIATED: App has initiated the SMS send request.
+ * 2. ACCEPTED_BY_TELEPHONY: SmsManager accepted the request without immediate error.
+ * 3. SENT_SUCCESS / SENT_FAILED: Android radio/carrier network reported transmission result.
+ * 4. DELIVERED / DELIVERY_FAILED: Android carrier SMSC reported recipient delivery status (if supported).
+ */
+enum class SmsDeliveryStatus {
+    IDLE,
+    INITIATED,
+    ACCEPTED_BY_TELEPHONY,
+    SENT_SUCCESS,
+    SENT_FAILED,
+    DELIVERED,
+    DELIVERY_FAILED
+}
+
+object EmergencyUtils {
+    /**
+     * Validates whether a given recipient string is a plausible phone number.
+     * Requires between 7 and 20 characters, allowing digits, an optional leading '+',
+     * spaces, and hyphens. At least 7 numeric digits required.
+     */
+    fun isValidPhoneNumber(number: String?): Boolean {
+        if (number.isNullOrBlank()) return false
+        val trimmed = number.trim()
+        val regex = Regex("^\\+?[0-9\\s\\-]{7,20}$")
+        if (!regex.matches(trimmed)) return false
+        val digitCount = trimmed.count { it.isDigit() }
+        return digitCount in 7..15
+    }
+
+    /**
+     * Builds the emergency SMS alert message.
+     * Contains:
+     * - AEGIS emergency alert identification
+     * - Statement that an emergency has been triggered
+     * - Emergency event ID when available
+     * - GPS omitted (per Phase 2 instructions: no invented coordinates)
+     */
+    fun buildEmergencySmsMessage(eventId: String?, idempotencyKey: String): String {
+        return if (!eventId.isNullOrBlank()) {
+            "AEGIS EMERGENCY ALERT: Emergency has been triggered! Event ID: $eventId"
+        } else {
+            "AEGIS EMERGENCY ALERT: Emergency has been triggered! (Backend offline / Ref: ${idempotencyKey.take(8)})"
+        }
+    }
+
+    /**
+     * Builds a clearly labeled non-emergency test SMS message.
+     */
+    fun buildTestSmsMessage(): String {
+        return "AEGIS [NON-EMERGENCY TEST]: This is a test message from Phone A to verify SMS connectivity. No emergency has occurred."
+    }
+}

@@ -1,0 +1,72 @@
+package com.example.aegis
+
+import okhttp3.OkHttpClient
+import retrofit2.Response
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.Body
+import retrofit2.http.POST
+import java.util.concurrent.TimeUnit
+
+data class SOSRequest(
+    val device_id: String,
+    val idempotency_key: String,
+    val trigger_source: String = "manual"
+)
+
+data class SOSResponse(
+    val event_id: String,
+    val status: String,
+    val message: String
+)
+
+interface AegisApi {
+    @POST("api/emergencies")
+    suspend fun createEmergency(
+        @Body request: SOSRequest
+    ): Response<SOSResponse>
+}
+
+object AegisApiClient {
+
+    // Default laptop Wi-Fi IPv4 address.
+    const val DEFAULT_BASE_URL = "http://192.168.1.4:8000/"
+
+    @Volatile
+    private var currentBaseUrl: String = DEFAULT_BASE_URL
+
+    @Volatile
+    private var apiInstance: AegisApi? = null
+
+    var baseUrl: String
+        get() = currentBaseUrl
+        set(value) {
+            val normalized = if (value.endsWith("/")) value else "$value/"
+            if (normalized != currentBaseUrl) {
+                currentBaseUrl = normalized
+                apiInstance = null
+            }
+        }
+
+    val api: AegisApi
+        get() {
+            return apiInstance ?: synchronized(this) {
+                apiInstance ?: buildRetrofit(currentBaseUrl).also { apiInstance = it }
+            }
+        }
+
+    private fun buildRetrofit(url: String): AegisApi {
+        val okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            .build()
+
+        return Retrofit.Builder()
+            .baseUrl(url)
+            .client(okHttpClient)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(AegisApi::class.java)
+    }
+}

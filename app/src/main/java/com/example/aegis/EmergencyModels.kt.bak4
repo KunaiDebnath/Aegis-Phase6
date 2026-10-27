@@ -1,0 +1,125 @@
+package com.example.aegis
+
+import java.util.Locale
+
+/**
+ * Represents the status of the emergency backend synchronization.
+ */
+enum class BackendSyncStatus {
+    IDLE,
+    SENDING,
+    RECORDED,
+    FAILED
+}
+
+/**
+ * Represents the 4-phase status of the SMS emergency alert delivery:
+ * 1. INITIATED: App has initiated the SMS send request.
+ * 2. ACCEPTED_BY_TELEPHONY: SmsManager accepted the request without immediate error.
+ * 3. SENT_SUCCESS / SENT_FAILED: Android radio/carrier network reported transmission result.
+ * 4. DELIVERED / DELIVERY_FAILED: Android carrier SMSC reported recipient delivery status (if supported).
+ */
+enum class SmsDeliveryStatus {
+    IDLE,
+    INITIATED,
+    ACCEPTED_BY_TELEPHONY,
+    SENT_SUCCESS,
+    SENT_FAILED,
+    DELIVERED,
+    DELIVERY_FAILED
+}
+
+/**
+ * Represents the status of the GPS emergency location acquisition.
+ */
+enum class LocationAcquisitionStatus {
+    IDLE,
+    ACQUIRING,
+    SUCCESS,
+    UNAVAILABLE,
+    TIMEOUT,
+    PERMISSION_DENIED
+}
+
+/**
+ * Encapsulates an emergency geographic coordinate fix with optional accuracy and timestamp.
+ */
+data class EmergencyLocation(
+    val latitude: Double,
+    val longitude: Double,
+    val accuracyMeters: Float? = null,
+    val timestamp: Long = System.currentTimeMillis()
+) {
+    fun isValid(): Boolean {
+        return EmergencyUtils.isValidCoordinate(latitude, longitude)
+    }
+
+    /**
+     * Google Maps link with coordinates formatted to 5 decimal places (~1.1 meter precision),
+     * ensuring high accuracy while keeping SMS messages concise.
+     */
+    fun toGoogleMapsUrl(): String {
+        val latStr = String.format(Locale.US, "%.5f", latitude)
+        val lngStr = String.format(Locale.US, "%.5f", longitude)
+        return "https://www.google.com/maps?q=$latStr,$lngStr"
+    }
+}
+
+object EmergencyUtils {
+    /**
+     * Validates whether a given recipient string is a plausible phone number.
+     * Requires between 7 and 20 characters, allowing digits, an optional leading '+',
+     * spaces, and hyphens. At least 7 numeric digits required.
+     */
+    fun isValidPhoneNumber(number: String?): Boolean {
+        if (number.isNullOrBlank()) return false
+        val trimmed = number.trim()
+        val regex = Regex("^\\+?[0-9\\s\\-]{7,20}$")
+        if (!regex.matches(trimmed)) return false
+        val digitCount = trimmed.count { it.isDigit() }
+        return digitCount in 7..15
+    }
+
+    /**
+     * Validates that latitude is between -90 and 90, and longitude is between -180 and 180.
+     */
+    fun isValidCoordinate(latitude: Double?, longitude: Double?): Boolean {
+        if (latitude == null || longitude == null) return false
+        return latitude in -90.0..90.0 && longitude in -180.0..180.0
+    }
+
+    /**
+     * Builds the emergency SMS alert message for Phase 3.
+     * When valid coordinates are present: includes Google Maps link.
+     * When location is unavailable: explicitly states (Location unavailable) without a map link.
+     * When backend event ID is present: references Event ID.
+     * When backend is offline: references idempotency key prefix.
+     */
+    fun buildEmergencySmsMessage(
+        eventId: String?,
+        idempotencyKey: String,
+        location: EmergencyLocation?
+    ): String {
+        val eventRef = if (!eventId.isNullOrBlank()) {
+            "Event: $eventId"
+        } else {
+            "Ref: ${idempotencyKey.take(8)}"
+        }
+
+        val hasValidLocation = location != null && isValidCoordinate(location.latitude, location.longitude)
+        val locationPart = if (hasValidLocation) {
+            "Location: ${location!!.toGoogleMapsUrl()}"
+        } else {
+            "(Location unavailable)"
+        }
+
+        return "AEGIS EMERGENCY ALERT: An emergency has been triggered. $eventRef. $locationPart"
+    }
+
+    /**
+     * Builds a clearly labeled non-emergency test SMS message.
+     */
+    fun buildTestSmsMessage(): String {
+        return "AEGIS [NON-EMERGENCY TEST]: This is a test message from Phone A to verify SMS connectivity. No emergency has occurred."
+    }
+}

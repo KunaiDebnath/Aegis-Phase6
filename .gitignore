@@ -1,0 +1,41 @@
+*.iml
+.gradle
+/local.properties
+
+# Backend
+backend/.env
+backend/serviceAccountKey.json
+backend/*serviceAccount*.json
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# LiveKit binaries
+livekit/*.exe
+livekit/*.zip
+
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Backend
+backend/.env
+backend/serviceAccountKey.json
+backend/*serviceAccount*.json
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# LiveKit binaries
+livekit/*.exe
+livekit/*.zip
+

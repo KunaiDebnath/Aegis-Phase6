@@ -1,0 +1,22 @@
+# AEGIS Phase 5 - LiveKit Server Docker Compose Deployment
+# Official LiveKit Server image
+
+version: '3.8'
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.11
+    container_name: aegis-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      # Signaling port (HTTP / WebSocket)
+      - "7880:7880"
+      # WebRTC ICE TCP fallback
+      - "7881:7881"
+      # WebRTC ICE UDP media ports
+      - "50000-50100:50000-50100/udp"
+    environment:
+      - LIVEKIT_CONFIG=/etc/livekit.yaml

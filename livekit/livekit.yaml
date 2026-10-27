@@ -1,0 +1,24 @@
+# AEGIS Phase 5 - Self-Hosted LiveKit Server Configuration
+# Local Wi-Fi Development on Windows Laptop
+
+port: 7880
+bind_addresses:
+  - ""
+
+rtc:
+  # TCP fallback for environments where UDP is blocked
+  tcp_port: 7881
+  # Dedicated port range for WebRTC media (UDP)
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: false
+  # Laptop LAN IPv4 address on local Wi-Fi network.
+  # Update this if your Wi-Fi router assigns a different IP.
+  node_ip: "192.168.1.4"
+
+# API keys and secrets for server token verification
+keys:
+  aegis_key: aegis_dev_secret_key_for_livekit_safety_calling_32b
+
+logging:
+  level: info

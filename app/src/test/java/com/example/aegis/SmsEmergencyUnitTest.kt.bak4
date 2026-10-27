@@ -1,0 +1,166 @@
+package com.example.aegis
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.UUID
+
+class SmsEmergencyUnitTest {
+
+    @Test
+    fun testPhoneNumberValidation_validNumbers() {
+        assertTrue(EmergencyUtils.isValidPhoneNumber("+1234567890"))
+        assertTrue(EmergencyUtils.isValidPhoneNumber("+919876543210"))
+        assertTrue(EmergencyUtils.isValidPhoneNumber("1234567890"))
+        assertTrue(EmergencyUtils.isValidPhoneNumber("+44 20 7946 0958"))
+        assertTrue(EmergencyUtils.isValidPhoneNumber("+1-800-555-0199"))
+    }
+
+    @Test
+    fun testPhoneNumberValidation_invalidNumbers() {
+        assertFalse("Empty string should be invalid", EmergencyUtils.isValidPhoneNumber(""))
+        assertFalse("Whitespace should be invalid", EmergencyUtils.isValidPhoneNumber("   "))
+        assertFalse("Null should be invalid", EmergencyUtils.isValidPhoneNumber(null))
+        assertFalse("Too short should be invalid", EmergencyUtils.isValidPhoneNumber("12345"))
+        assertFalse("Characters should be invalid", EmergencyUtils.isValidPhoneNumber("1234abc567"))
+        assertFalse("Special chars should be invalid", EmergencyUtils.isValidPhoneNumber("!@#$%^&*()"))
+        assertFalse("Too long should be invalid", EmergencyUtils.isValidPhoneNumber("+123456789012345678901"))
+    }
+
+    @Test
+    fun testCoordinateValidation_validAndInvalidBounds() {
+        // Valid coordinates
+        assertTrue(EmergencyUtils.isValidCoordinate(0.0, 0.0))
+        assertTrue(EmergencyUtils.isValidCoordinate(37.7749, -122.4194))
+        assertTrue(EmergencyUtils.isValidCoordinate(90.0, 180.0))
+        assertTrue(EmergencyUtils.isValidCoordinate(-90.0, -180.0))
+
+        // Invalid latitudes
+        assertFalse(EmergencyUtils.isValidCoordinate(90.1, 0.0))
+        assertFalse(EmergencyUtils.isValidCoordinate(-90.1, 0.0))
+
+        // Invalid longitudes
+        assertFalse(EmergencyUtils.isValidCoordinate(0.0, 180.1))
+        assertFalse(EmergencyUtils.isValidCoordinate(0.0, -180.1))
+
+        // Null coordinates
+        assertFalse(EmergencyUtils.isValidCoordinate(null, 10.0))
+        assertFalse(EmergencyUtils.isValidCoordinate(10.0, null))
+        assertFalse(EmergencyUtils.isValidCoordinate(null, null))
+    }
+
+    @Test
+    fun testBuildEmergencySmsMessage_withEventIdAndCoordinates() {
+        val eventId = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        val idempotencyKey = "uuid-key-123"
+        val location = EmergencyLocation(
+            latitude = 37.774929,
+            longitude = -122.419416,
+            accuracyMeters = 8.5f
+        )
+        val message = EmergencyUtils.buildEmergencySmsMessage(eventId, idempotencyKey, location)
+
+        assertTrue(message.contains("AEGIS EMERGENCY ALERT"))
+        assertTrue(message.contains("An emergency has been triggered"))
+        assertTrue(message.contains("Event: $eventId"))
+        assertTrue(message.contains("Location: https://www.google.com/maps?q=37.77493,-122.41942"))
+        assertFalse(message.contains("Location unavailable"))
+        assertFalse(message.contains("Ref:"))
+        assertTrue("SMS length within standard GSM single SMS (160 characters)", message.length <= 160)
+    }
+
+    @Test
+    fun testBuildEmergencySmsMessage_withEventIdAndLocationUnavailable() {
+        val eventId = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        val idempotencyKey = "uuid-key-123"
+        val message = EmergencyUtils.buildEmergencySmsMessage(eventId, idempotencyKey, null)
+
+        assertTrue(message.contains("AEGIS EMERGENCY ALERT"))
+        assertTrue(message.contains("An emergency has been triggered"))
+        assertTrue(message.contains("Event: $eventId"))
+        assertTrue(message.contains("(Location unavailable)"))
+        assertFalse(message.contains("google.com/maps"))
+        assertTrue("SMS length within standard GSM single SMS", message.length <= 160)
+    }
+
+    @Test
+    fun testBuildEmergencySmsMessage_backendOfflineWithCoordinates() {
+        val idempotencyKey = "d8b0213b-15f1-4fc3-a55e-045a557b4478"
+        val location = EmergencyLocation(
+            latitude = 12.9716,
+            longitude = 77.5946
+        )
+        val message = EmergencyUtils.buildEmergencySmsMessage(null, idempotencyKey, location)
+
+        assertTrue(message.contains("AEGIS EMERGENCY ALERT"))
+        assertTrue(message.contains("An emergency has been triggered"))
+        assertTrue(message.contains("Ref: d8b0213b"))
+        assertTrue(message.contains("Location: https://www.google.com/maps?q=12.97160,77.59460"))
+        assertFalse(message.contains("Event:"))
+        assertTrue(message.length <= 160)
+    }
+
+    @Test
+    fun testBuildEmergencySmsMessage_backendOfflineLocationUnavailable() {
+        val idempotencyKey = "d8b0213b-15f1-4fc3-a55e-045a557b4478"
+        val message = EmergencyUtils.buildEmergencySmsMessage(null, idempotencyKey, null)
+
+        assertTrue(message.contains("AEGIS EMERGENCY ALERT"))
+        assertTrue(message.contains("An emergency has been triggered"))
+        assertTrue(message.contains("Ref: d8b0213b"))
+        assertTrue(message.contains("(Location unavailable)"))
+        assertFalse(message.contains("google.com/maps"))
+        assertTrue(message.length <= 160)
+    }
+
+    @Test
+    fun testBuildEmergencySmsMessage_rejectsInvalidCoordinatesInMessage() {
+        val eventId = "test-event-123"
+        val idempotencyKey = "key-123"
+        // Invalid latitude 95.0
+        val invalidLocation = EmergencyLocation(latitude = 95.0, longitude = 10.0)
+        val message = EmergencyUtils.buildEmergencySmsMessage(eventId, idempotencyKey, invalidLocation)
+
+        assertTrue("Invalid coordinates should fallback to location unavailable", message.contains("(Location unavailable)"))
+        assertFalse("Should never contain invalid coordinates map link", message.contains("google.com/maps"))
+    }
+
+    @Test
+    fun testBuildTestSmsMessage_distinguishedFromEmergency() {
+        val testMessage = EmergencyUtils.buildTestSmsMessage()
+
+        assertTrue(testMessage.contains("NON-EMERGENCY TEST"))
+        assertTrue(testMessage.contains("No emergency has occurred"))
+        assertFalse(testMessage.contains("Emergency has been triggered"))
+        assertTrue("Single SMS length within limit", testMessage.length <= 160)
+    }
+
+    @Test
+    fun testIdempotencyKeyGeneration_uniqueAcrossEvents() {
+        val key1 = UUID.randomUUID().toString()
+        val key2 = UUID.randomUUID().toString()
+
+        assertNotEquals(key1, key2)
+        assertEquals(36, key1.length)
+        assertEquals(36, key2.length)
+    }
+
+    @Test
+    fun testStatusEnums_completenessAndDistinction() {
+        val smsStates = SmsDeliveryStatus.values().toSet()
+        assertEquals(7, smsStates.size)
+
+        val locStates = LocationAcquisitionStatus.values().toSet()
+        assertEquals(6, locStates.size)
+        assertTrue(locStates.contains(LocationAcquisitionStatus.ACQUIRING))
+        assertTrue(locStates.contains(LocationAcquisitionStatus.SUCCESS))
+        assertTrue(locStates.contains(LocationAcquisitionStatus.UNAVAILABLE))
+        assertTrue(locStates.contains(LocationAcquisitionStatus.TIMEOUT))
+        assertTrue(locStates.contains(LocationAcquisitionStatus.PERMISSION_DENIED))
+
+        val backendStates = BackendSyncStatus.values().toSet()
+        assertEquals(4, backendStates.size)
+    }
+}
