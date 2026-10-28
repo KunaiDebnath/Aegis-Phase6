@@ -2,10 +2,10 @@ package com.example.aegis
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,15 +15,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -35,16 +35,29 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.aegis.ui.components.AegisCard
+import com.example.aegis.ui.components.AegisPrimaryButton
+import com.example.aegis.ui.components.AegisStatusPill
+import com.example.aegis.ui.components.AegisStatusTone
+import com.example.aegis.ui.components.AegisTopBar
+import com.example.aegis.ui.theme.AegisBlueSoft
+import com.example.aegis.ui.theme.AegisGrey100
+import com.example.aegis.ui.theme.AegisGrey200
+import com.example.aegis.ui.theme.AegisGrey500
+import com.example.aegis.ui.theme.AegisNavy
+import com.example.aegis.ui.theme.AegisNavyDark
+import com.example.aegis.ui.theme.AegisWhite
 import kotlinx.coroutines.launch
 
 /**
- * Dedicated Role Selection Screen shown when no role has been chosen yet on this physical device.
- * Once a selection is made, it is persistently remembered on this phone.
+ * Dedicated Role Selection Screen matching Figma 'role' design with native Jetpack Compose.
+ * Remembers selected role locally on this physical device.
  */
 @Composable
 fun RoleSelectionScreen(
@@ -53,7 +66,7 @@ fun RoleSelectionScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var isSelecting by remember { mutableStateOf(false) }
-    var selectedTarget by remember { mutableStateOf<String?>(null) }
+    var selectedRole by remember { mutableStateOf(DeviceRoleManager.ROLE_PHONE_A) }
     var backendUrlInput by remember { mutableStateOf(AegisApiClient.baseUrl) }
 
     val discoveredUrl = ServerDiscoveryManager.connectedUrl.value
@@ -69,357 +82,276 @@ fun RoleSelectionScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 20.dp, vertical = 24.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .background(AegisWhite)
     ) {
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // App Logo & Header
-        Text(
-            text = "AEGIS",
-            style = MaterialTheme.typography.headlineLarge,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary,
-            fontSize = 36.sp
+        AegisTopBar(
+            title = "Choose device role",
+            subtitle = "You can change this later"
         )
 
-        Spacer(modifier = Modifier.height(4.dp))
-
-        Text(
-            text = "Your Voice. Your Safety. Your Lifeline.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Text(
-            text = "Device Role Setup",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold
-        )
-
-        Spacer(modifier = Modifier.height(6.dp))
-
-        Text(
-            text = "Select how this phone will be used. Each device stores its own role locally and will remember it on future launches.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 8.dp)
-        )
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // Role Card: Phone A (Emergency Requester)
-        Card(
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .border(
-                    width = 2.dp,
-                    color = Color(0xFFD32F2F).copy(alpha = 0.6f),
-                    shape = RoundedCornerShape(14.dp)
-                ),
-            colors = CardDefaults.cardColors(
-                containerColor = Color(0xFFFFEBEE).copy(alpha = 0.5f)
-            ),
-            shape = RoundedCornerShape(14.dp)
+                .fillMaxSize()
+                .padding(horizontal = 20.dp, vertical = 22.dp)
+                .verticalScroll(rememberScrollState())
         ) {
-            Column(modifier = Modifier.padding(18.dp)) {
+            Text(
+                text = "How will you use AEGIS?",
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                color = AegisNavy
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "This selection configures this device. It is not an account sign-in.",
+                fontSize = 14.sp,
+                color = AegisGrey500,
+                lineHeight = 20.sp
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // Role Card 1: Person Needing Help (Phone A)
+            val isSelectedA = selectedRole == DeviceRoleManager.ROLE_PHONE_A
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .border(
+                        width = if (isSelectedA) 2.dp else 1.dp,
+                        color = if (isSelectedA) AegisNavyDark else AegisGrey200,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .background(if (isSelectedA) AegisBlueSoft else AegisWhite)
+                    .clickable { selectedRole = DeviceRoleManager.ROLE_PHONE_A }
+                    .padding(14.dp)
+            ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Phone A — Requester",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFB71C1C)
-                    )
-
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xFFD32F2F), shape = RoundedCornerShape(6.dp))
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = "EMERGENCY USER",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Text(
-                    text = "For the person who may need emergency protection and assistance.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("• Hands-free voice emergency detection (\"I need help\")", style = MaterialTheme.typography.bodySmall)
-                    Text("• Big red one-tap Manual SOS trigger", style = MaterialTheme.typography.bodySmall)
-                    Text("• Automatic GPS coordinate fix & Google Maps link", style = MaterialTheme.typography.bodySmall)
-                    Text("• SIM-based cellular SMS alert broadcast", style = MaterialTheme.typography.bodySmall)
-                    Text("• Two-way LiveKit WebRTC audio calling", style = MaterialTheme.typography.bodySmall)
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Button(
-                    onClick = {
-                        if (!isSelecting) {
-                            isSelecting = true
-                            selectedTarget = DeviceRoleManager.ROLE_PHONE_A
-                            coroutineScope.launch {
-                                DeviceRoleManager.selectRole(context, DeviceRoleManager.ROLE_PHONE_A)
-                                isSelecting = false
-                                onRoleSelected(DeviceRoleManager.ROLE_PHONE_A)
-                            }
-                        }
-                    },
-                    enabled = !isSelecting,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFD32F2F),
-                        contentColor = Color.White
-                    )
-                ) {
-                    if (isSelecting && selectedTarget == DeviceRoleManager.ROLE_PHONE_A) {
-                        CircularProgressIndicator(
-                            color = Color.White,
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    Text("SELECT THIS PHONE AS PHONE A", fontWeight = FontWeight.Bold)
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        // Role Card: Phone B (Trusted Contact Responder)
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(
-                    width = 2.dp,
-                    color = Color(0xFF1976D2).copy(alpha = 0.6f),
-                    shape = RoundedCornerShape(14.dp)
-                ),
-            colors = CardDefaults.cardColors(
-                containerColor = Color(0xFFE3F2FD).copy(alpha = 0.5f)
-            ),
-            shape = RoundedCornerShape(14.dp)
-        ) {
-            Column(modifier = Modifier.padding(18.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Phone B — Responder",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF0D47A1)
-                    )
-
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xFF1976D2), shape = RoundedCornerShape(6.dp))
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = "TRUSTED CONTACT",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Text(
-                    text = "For the trusted contact, guardian, or family member responding to alerts.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("• High-priority real-time emergency call notifications", style = MaterialTheme.typography.bodySmall)
-                    Text("• Lock-screen wake and full-screen incoming alert ringing", style = MaterialTheme.typography.bodySmall)
-                    Text("• One-tap Call Answer & Dismiss action buttons", style = MaterialTheme.typography.bodySmall)
-                    Text("• Join emergency calls using Event ID from SMS alert", style = MaterialTheme.typography.bodySmall)
-                    Text("• Live two-way WebRTC audio connection to help requester", style = MaterialTheme.typography.bodySmall)
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Button(
-                    onClick = {
-                        if (!isSelecting) {
-                            isSelecting = true
-                            selectedTarget = DeviceRoleManager.ROLE_PHONE_B
-                            coroutineScope.launch {
-                                DeviceRoleManager.selectRole(context, DeviceRoleManager.ROLE_PHONE_B)
-                                isSelecting = false
-                                onRoleSelected(DeviceRoleManager.ROLE_PHONE_B)
-                            }
-                        }
-                    },
-                    enabled = !isSelecting,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF1976D2),
-                        contentColor = Color.White
-                    )
-                ) {
-                    if (isSelecting && selectedTarget == DeviceRoleManager.ROLE_PHONE_B) {
-                        CircularProgressIndicator(
-                            color = Color.White,
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    Text("SELECT THIS PHONE AS PHONE B", fontWeight = FontWeight.Bold)
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Backend URL Settings for Setup Verification
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-            ),
-            shape = RoundedCornerShape(10.dp)
-        ) {
-            Column(modifier = Modifier.padding(14.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Automatic Server Discovery",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold
-                    )
-
-                    val discState = ServerDiscoveryManager.state.value
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                color = when (discState) {
-                                    DiscoveryState.CONNECTED -> Color(0xFF2E7D32)
-                                    DiscoveryState.DISCOVERING -> Color(0xFF1976D2)
-                                    DiscoveryState.VALIDATING -> Color(0xFFF57C00)
-                                    DiscoveryState.FAILED -> Color(0xFFC62828)
-                                    DiscoveryState.IDLE -> Color(0xFF757575)
-                                },
-                                shape = RoundedCornerShape(6.dp)
-                            )
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = when (discState) {
-                                DiscoveryState.CONNECTED -> "FOUND"
-                                DiscoveryState.DISCOVERING -> "SCANNING..."
-                                DiscoveryState.VALIDATING -> "VALIDATING"
-                                DiscoveryState.FAILED -> "NOT FOUND"
-                                DiscoveryState.IDLE -> "IDLE"
-                            },
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = ServerDiscoveryManager.statusMessage.value,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            ServerDiscoveryManager.startDiscovery(context, forceFullDiscovery = true)
-                        },
-                        enabled = !ServerDiscoveryManager.isAutoDiscovering.value,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        if (ServerDiscoveryManager.isAutoDiscovering.value) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                        }
-                        Text("AUTO DISCOVER", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            coroutineScope.launch {
-                                ServerDiscoveryManager.applyManualEndpoint(context, backendUrlInput)
-                            }
-                        },
-                        enabled = !ServerDiscoveryManager.isAutoDiscovering.value,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text("TEST & SAVE", fontSize = 12.sp)
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                OutlinedTextField(
-                    value = backendUrlInput,
-                    onValueChange = {
-                        backendUrlInput = it
-                        AegisApiClient.baseUrl = it
-                        AegisPreferences.setBaseUrl(context, it)
-                    },
-                    label = { Text("Backend URL (Manual Override)") },
-                    singleLine = true,
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
-                )
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(if (isSelectedA) AegisWhite else AegisBlueSoft),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Shield,
+                            contentDescription = null,
+                            tint = AegisNavyDark,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Person Needing Help",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AegisNavy
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Send SOS alerts to your trusted guardian.",
+                            fontSize = 11.sp,
+                            color = AegisGrey500,
+                            lineHeight = 16.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    // Radio circle
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .border(
+                                width = if (isSelectedA) 5.dp else 2.dp,
+                                color = if (isSelectedA) AegisNavyDark else AegisGrey200,
+                                shape = CircleShape
+                            )
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Role Card 2: Guardian (Phone B)
+            val isSelectedB = selectedRole == DeviceRoleManager.ROLE_PHONE_B
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .border(
+                        width = if (isSelectedB) 2.dp else 1.dp,
+                        color = if (isSelectedB) AegisNavyDark else AegisGrey200,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .background(if (isSelectedB) AegisBlueSoft else AegisWhite)
+                    .clickable { selectedRole = DeviceRoleManager.ROLE_PHONE_B }
+                    .padding(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(if (isSelectedB) AegisWhite else AegisBlueSoft),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Person,
+                            contentDescription = null,
+                            tint = AegisNavyDark,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Guardian",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AegisNavy
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Receive alerts and calls from a connected person.",
+                            fontSize = 11.sp,
+                            color = AegisGrey500,
+                            lineHeight = 16.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    // Radio circle
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .border(
+                                width = if (isSelectedB) 5.dp else 2.dp,
+                                color = if (isSelectedB) AegisNavyDark else AegisGrey200,
+                                shape = CircleShape
+                            )
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            AegisPrimaryButton(
+                text = "Continue",
+                isLoading = isSelecting,
+                onClick = {
+                    if (!isSelecting) {
+                        isSelecting = true
+                        coroutineScope.launch {
+                            DeviceRoleManager.selectRole(context, selectedRole)
+                            isSelecting = false
+                            onRoleSelected(selectedRole)
+                        }
+                    }
+                }
+            )
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            // LAN Server Discovery Card (Clean & Preserved)
+            AegisCard {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Automatic Server Discovery",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AegisNavy
+                        )
+
+                        val discState = ServerDiscoveryManager.state.value
+                        val pillTone = when (discState) {
+                            DiscoveryState.CONNECTED -> AegisStatusTone.GOOD
+                            DiscoveryState.DISCOVERING -> AegisStatusTone.WAIT
+                            DiscoveryState.VALIDATING -> AegisStatusTone.WAIT
+                            DiscoveryState.FAILED -> AegisStatusTone.BAD
+                            DiscoveryState.IDLE -> AegisStatusTone.NEUTRAL
+                        }
+                        val pillLabel = when (discState) {
+                            DiscoveryState.CONNECTED -> "Found"
+                            DiscoveryState.DISCOVERING -> "Scanning"
+                            DiscoveryState.VALIDATING -> "Validating"
+                            DiscoveryState.FAILED -> "Not found"
+                            DiscoveryState.IDLE -> "Idle"
+                        }
+                        AegisStatusPill(label = pillLabel, tone = pillTone)
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        text = ServerDiscoveryManager.statusMessage.value,
+                        fontSize = 11.sp,
+                        color = AegisGrey500
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        AegisPrimaryButton(
+                            text = "Auto Discover",
+                            isLoading = ServerDiscoveryManager.isAutoDiscovering.value,
+                            quiet = true,
+                            onClick = {
+                                ServerDiscoveryManager.startDiscovery(context, forceFullDiscovery = true)
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        AegisPrimaryButton(
+                            text = "Test & Save",
+                            quiet = true,
+                            onClick = {
+                                coroutineScope.launch {
+                                    ServerDiscoveryManager.applyManualEndpoint(context, backendUrlInput)
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedTextField(
+                        value = backendUrlInput,
+                        onValueChange = {
+                            backendUrlInput = it
+                            AegisApiClient.baseUrl = it
+                            AegisPreferences.setBaseUrl(context, it)
+                        },
+                        label = { Text("Backend URL (Manual Override)", fontSize = 12.sp) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
     }
 }

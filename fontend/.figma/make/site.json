@@ -1,0 +1,10 @@
+{
+  "description": "AEGIS helps people request emergency assistance through SOS alerts, voice activation, GPS sharing, and audio calls, while giving guardians clear alerts and response tools.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
